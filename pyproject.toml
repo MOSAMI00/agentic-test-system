@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-test"
+version = "0.1.0"
+description = "Agentic Test Generation and Maintenance System"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Implementation Engineer" }]
+dependencies = [
+    "pydantic>=2.8.2",
+    "pydantic-settings>=2.4.0",
+    "gitpython>=3.1.43",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.2",
+    "pytest-cov>=5.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
