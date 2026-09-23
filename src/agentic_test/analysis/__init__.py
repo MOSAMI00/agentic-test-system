@@ -2,6 +2,21 @@
 Analysis and repository ingestion services.
 """
 
+from agentic_test.analysis.ast_analyzer import PythonASTAnalyzer
+from agentic_test.analysis.discovery import (
+    AssociationClassification,
+    EvidenceKind,
+    StaticAssociation,
+    TestDiscovery,
+)
 from agentic_test.analysis.git_service import GitService, is_excluded_path
 
-__all__ = ["GitService", "is_excluded_path"]
+__all__ = [
+    "AssociationClassification",
+    "EvidenceKind",
+    "GitService",
+    "PythonASTAnalyzer",
+    "StaticAssociation",
+    "TestDiscovery",
+    "is_excluded_path",
+]

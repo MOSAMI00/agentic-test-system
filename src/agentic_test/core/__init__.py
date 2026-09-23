@@ -1,5 +1,5 @@
 """
-Core models, state, and configuration for agentic_test.
+Core models, state, protocols, and configuration for agentic_test.
 """
 
 from agentic_test.core.models import (
@@ -18,11 +18,13 @@ from agentic_test.core.models import (
     ValidationStatus,
     WorkflowRoute,
 )
+from agentic_test.core.protocols.analyzer import CodeAnalyzer, SyntaxParsingError
 from agentic_test.core.state import WorkflowState
 from agentic_test.core.config import Settings, settings
 
 __all__ = [
     "ChangeType",
+    "CodeAnalyzer",
     "DiffHunk",
     "ExecutionEvidence",
     "ExecutionPlan",
@@ -32,6 +34,7 @@ __all__ = [
     "RepositoryValidationError",
     "SymbolContract",
     "SymbolType",
+    "SyntaxParsingError",
     "TestCandidate",
     "TriageEngine",
     "ValidationStatus",
