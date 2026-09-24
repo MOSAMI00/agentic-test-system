@@ -600,3 +600,123 @@ def test_ambiguous_external_helper(tmp_path: Path) -> None:
     assert associations[0].evidence_kind == EvidenceKind.EXTERNAL_HELPER
     assert discovery.extract_tested_symbols(test_file) == []
 
+
+def test_mock_disqualification_same_symbol_distinct_modules(tmp_path: Path) -> None:
+    """
+    Verifies that mocking a symbol in one module (pkg.mod_a.execute) does NOT
+    disqualify a symbol with the same simple name in a distinct module (pkg.mod_b.execute)
+    (Corrective Task 2 & 4).
+    """
+    test_file = tmp_path / "test_mock_distinct.py"
+    test_file.write_text(
+        "from unittest.mock import patch\n"
+        "from pkg.mod_a import execute\n"
+        "\n"
+        "@patch('pkg.mod_a.execute')\n"
+        "def test_a(mock_exec):\n"
+        "    execute()\n",
+        encoding="utf-8",
+    )
+
+    sym_a = SymbolContract(
+        qualified_name="pkg.mod_a.execute",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/pkg/mod_a.py"),
+        line_range=(1, 5),
+        signature="def execute()",
+    )
+    sym_b = SymbolContract(
+        qualified_name="pkg.mod_b.execute",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/pkg/mod_b.py"),
+        line_range=(1, 5),
+        signature="def execute()",
+    )
+
+    discovery = TestDiscovery(target_symbols=[sym_b, sym_a])
+    assocs = discovery.analyze_associations(test_file, [sym_b, sym_a])
+
+    # sym_a is mocked and therefore UNSUPPORTED
+    assocs_a = [a for a in assocs if a.target_symbol == "pkg.mod_a.execute"]
+    assert len(assocs_a) == 1
+    assert assocs_a[0].classification == AssociationClassification.UNSUPPORTED
+    assert assocs_a[0].evidence_kind == EvidenceKind.EXPLICIT_MOCK_DISQUALIFIED
+
+    # sym_b was never mocked or called in this file, so it MUST NOT be emitted
+    assocs_b = [a for a in assocs if a.target_symbol == "pkg.mod_b.execute"]
+    assert len(assocs_b) == 0
+
+
+def test_positive_call_same_symbol_distinct_modules(tmp_path: Path) -> None:
+    """
+    Verifies that direct import 'from foo import execute' strictly associates with
+    'foo.execute' and does NOT match 'my_pkg_foo.execute' via suffix matching (Corrective Task 2 & 4).
+    """
+    test_file = tmp_path / "test_positive_distinct.py"
+    test_file.write_text(
+        "from foo import execute\n"
+        "\n"
+        "def test_exec():\n"
+        "    execute()\n",
+        encoding="utf-8",
+    )
+
+    sym_foo = SymbolContract(
+        qualified_name="foo.execute",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/foo.py"),
+        line_range=(1, 5),
+        signature="def execute()",
+    )
+    sym_my_pkg_foo = SymbolContract(
+        qualified_name="my_pkg_foo.execute",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/my_pkg_foo.py"),
+        line_range=(1, 5),
+        signature="def execute()",
+    )
+
+    discovery = TestDiscovery(target_symbols=[sym_my_pkg_foo, sym_foo])
+    assocs = discovery.analyze_associations(test_file, [sym_my_pkg_foo, sym_foo])
+
+    # foo.execute matches directly
+    assocs_foo = [a for a in assocs if a.target_symbol == "foo.execute"]
+    assert len(assocs_foo) == 1
+    assert assocs_foo[0].classification == AssociationClassification.STATICALLY_ASSOCIATED
+    assert assocs_foo[0].evidence_kind == EvidenceKind.DIRECT_CALL
+
+    # my_pkg_foo.execute must NOT match via suffix substring
+    assocs_my_pkg_foo = [a for a in assocs if a.target_symbol == "my_pkg_foo.execute"]
+    assert len(assocs_my_pkg_foo) == 0
+
+
+def test_module_qualified_chained_attribute_call(tmp_path: Path) -> None:
+    """
+    Verifies that chained module calls such as 'pkg.mod_a.execute()' are correctly
+    resolved and associated (Corrective Task 2 & 4).
+    """
+    test_file = tmp_path / "test_chained.py"
+    test_file.write_text(
+        "import pkg.mod_a\n"
+        "\n"
+        "def test_call():\n"
+        "    pkg.mod_a.execute()\n",
+        encoding="utf-8",
+    )
+
+    sym_a = SymbolContract(
+        qualified_name="pkg.mod_a.execute",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/pkg/mod_a.py"),
+        line_range=(1, 5),
+        signature="def execute()",
+    )
+
+    discovery = TestDiscovery(target_symbols=[sym_a])
+    assocs = discovery.analyze_associations(test_file, [sym_a])
+
+    assert len(assocs) == 1
+    assert assocs[0].target_symbol == "pkg.mod_a.execute"
+    assert assocs[0].classification == AssociationClassification.STATICALLY_ASSOCIATED
+    assert assocs[0].evidence_kind == EvidenceKind.MODULE_QUALIFIED_CALL
+

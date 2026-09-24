@@ -6,15 +6,23 @@ Enforces INV-01 and INV-02: Zero target application code execution during parsin
 
 import ast
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from agentic_test.core.models import DiffHunk, SymbolContract, SymbolType
 from agentic_test.core.protocols.analyzer import CodeAnalyzer, SyntaxParsingError
 
 
-def _derive_module_name(file_path: Path) -> str:
+def _derive_module_name(file_path: Path, root_path: Optional[Path] = None) -> str:
     """Derives a normalized Python module name from a file path."""
-    parts = list(file_path.parts)
+    if root_path is not None:
+        try:
+            rel_path = file_path.resolve().relative_to(root_path.resolve())
+        except ValueError:
+            rel_path = file_path
+    else:
+        rel_path = file_path
+
+    parts = list(rel_path.parts)
     if not parts:
         return file_path.stem
 
@@ -26,10 +34,10 @@ def _derive_module_name(file_path: Path) -> str:
         return file_path.stem
 
     # If the file is __init__.py, the module name is the enclosing directory
-    if parts[-1] == "__init__.py" or file_path.stem == "__init__":
+    if parts[-1] == "__init__.py" or rel_path.stem == "__init__":
         if len(parts) > 1:
             return ".".join(parts[:-1])
-        return file_path.parent.name or "package"
+        return rel_path.parent.name or "package"
 
     # Replace last element with its stem
     stem = Path(parts[-1]).stem
@@ -70,10 +78,18 @@ class PythonASTAnalyzer(CodeAnalyzer):
     Parses Python source files using the standard library ast module without executing target code.
     """
 
+    def __init__(self, root_path: Optional[Path] = None) -> None:
+        """
+        Initializes PythonASTAnalyzer with an optional repository/source root path.
+
+        :param root_path: Root directory used to derive normalized module names.
+        """
+        self._root_path = root_path
+
     def parse_symbols(self, file_path: Path, content: str) -> List[SymbolContract]:
         """
         Statically parses Python source code content into structured SymbolContract entities.
-        Does NOT execute or import the parsed code.
+        Does NOT execute or import the parsed code. Preserves two-argument CodeAnalyzer protocol.
 
         :param file_path: Path to the target source file.
         :param content: Raw UTF-8 source code string.
@@ -85,7 +101,7 @@ class PythonASTAnalyzer(CodeAnalyzer):
         except SyntaxError as err:
             raise SyntaxParsingError(f"Syntax error parsing {file_path}: {err}") from err
 
-        module_name = _derive_module_name(file_path)
+        module_name = _derive_module_name(file_path, self._root_path)
         symbols: List[SymbolContract] = []
 
         for node in tree.body:
@@ -178,6 +194,85 @@ class PythonASTAnalyzer(CodeAnalyzer):
 
         return sorted(dependencies)
 
+    @staticmethod
+    def _extract_hunk_changes(hunk: DiffHunk) -> Tuple[Set[int], List[Tuple[int, int, bool]], bool]:
+        """
+        Parses unified diff hunk content to extract changed lines and deletion insertion boundaries.
+        Returns:
+            (added_lines, deletion_boundaries, has_evidence)
+            - added_lines: Set of 1-based new-file line numbers for '+' lines.
+            - deletion_boundaries: List of (L_prev, L_next, is_indented_body) for deletion blocks.
+            - has_evidence: True if hunk content contained parseable unified diff lines.
+        """
+        if not hunk.content or not hunk.content.strip():
+            return set(), [], False
+
+        lines = hunk.content.splitlines()
+        header_idx = -1
+        for idx, line in enumerate(lines):
+            if line.startswith("@@"):
+                header_idx = idx
+                break
+
+        if header_idx == -1:
+            return set(), [], False
+
+        added_lines: Set[int] = set()
+        deletion_boundaries: List[Tuple[int, int, bool]] = []
+        curr_new_line = hunk.new_start
+        has_evidence = False
+
+        in_deletion_run = False
+        del_prev_line = curr_new_line - 1
+        del_lines_content: List[str] = []
+
+        for line in lines[header_idx + 1:]:
+            if not line:
+                continue
+            prefix = line[0]
+            if prefix == " ":
+                if in_deletion_run:
+                    is_indented = all(
+                        c.startswith((" ", "\t")) and not c.lstrip().startswith(("def ", "class ", "@"))
+                        for c in del_lines_content if c.strip()
+                    ) and any(c.strip() for c in del_lines_content)
+                    deletion_boundaries.append((del_prev_line, curr_new_line, is_indented))
+                    in_deletion_run = False
+                    del_lines_content = []
+
+                curr_new_line += 1
+                del_prev_line = curr_new_line - 1
+            elif prefix == "+":
+                if in_deletion_run:
+                    is_indented = all(
+                        c.startswith((" ", "\t")) and not c.lstrip().startswith(("def ", "class ", "@"))
+                        for c in del_lines_content if c.strip()
+                    ) and any(c.strip() for c in del_lines_content)
+                    deletion_boundaries.append((del_prev_line, curr_new_line, is_indented))
+                    in_deletion_run = False
+                    del_lines_content = []
+
+                added_lines.add(curr_new_line)
+                curr_new_line += 1
+                del_prev_line = curr_new_line - 1
+                has_evidence = True
+            elif prefix == "-":
+                if not in_deletion_run:
+                    in_deletion_run = True
+                    del_prev_line = curr_new_line - 1
+                    del_lines_content = []
+                del_lines_content.append(line[1:])
+                has_evidence = True
+
+        if in_deletion_run:
+            is_indented = all(
+                c.startswith((" ", "\t")) and not c.lstrip().startswith(("def ", "class ", "@"))
+                for c in del_lines_content if c.strip()
+            ) and any(c.strip() for c in del_lines_content)
+            deletion_boundaries.append((del_prev_line, curr_new_line, is_indented))
+
+        return added_lines, deletion_boundaries, has_evidence
+
     def resolve_affected_symbols(
         self,
         symbols: List[SymbolContract],
@@ -186,6 +281,8 @@ class PythonASTAnalyzer(CodeAnalyzer):
         """
         Intersects unified diff line ranges with AST symbol spans to identify
         all callable symbols modified or introduced by the working tree diff.
+        Uses exact changed-line evidence and insertion boundaries from hunk.content when available;
+        falls back to coarse hunk bounding box only for synthetic hunks.
 
         :param symbols: Full list of extracted symbols for the repository.
         :param diff_hunks: Parsed unified diff hunks.
@@ -195,20 +292,37 @@ class PythonASTAnalyzer(CodeAnalyzer):
 
         for symbol in symbols:
             is_affected = False
+            sym_start, sym_end = symbol.line_range
             for hunk in diff_hunks:
                 # Compare file paths by path object or relative posix match
                 if not self._paths_match(symbol.file_path, hunk.file_path):
                     continue
 
-                # Compute modified line interval in new file
-                hunk_start = hunk.new_start
-                hunk_end = hunk.new_start + max(hunk.new_lines - 1, 0) if hunk.new_lines > 0 else hunk.new_start
+                added_lines, deletion_boundaries, has_evidence = self._extract_hunk_changes(hunk)
 
-                # Interval overlap test: max(start1, start2) <= min(end1, end2)
-                sym_start, sym_end = symbol.line_range
-                if max(sym_start, hunk_start) <= min(sym_end, hunk_end):
-                    is_affected = True
-                    break
+                if has_evidence:
+                    # 1. Exact added-line intersection
+                    if any(sym_start <= line <= sym_end for line in added_lines):
+                        is_affected = True
+                        break
+
+                    # 2. Deletion insertion-boundary intersection
+                    for l_prev, l_next, is_indented in deletion_boundaries:
+                        # Case A: Interior deletion (flanked by lines inside symbol)
+                        if sym_start <= l_prev and l_next <= sym_end:
+                            is_affected = True
+                            break
+                        # Case B: Trailing deletion of indented body
+                        if l_prev == sym_end and is_indented:
+                            is_affected = True
+                            break
+                else:
+                    # 3. Fallback coarse bounding box for synthetic hunks without content
+                    hunk_start = hunk.new_start
+                    hunk_end = hunk.new_start + max(hunk.new_lines - 1, 0) if hunk.new_lines > 0 else hunk.new_start
+                    if max(sym_start, hunk_start) <= min(sym_end, hunk_end):
+                        is_affected = True
+                        break
 
             if is_affected:
                 # Create an updated SymbolContract with is_affected=True

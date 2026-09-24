@@ -10,8 +10,10 @@ from agentic_test.analysis.discovery import (
     TestDiscovery,
 )
 from agentic_test.analysis.git_service import GitService, is_excluded_path
+from agentic_test.analysis.service import AnalysisService
 
 __all__ = [
+    "AnalysisService",
     "AssociationClassification",
     "EvidenceKind",
     "GitService",

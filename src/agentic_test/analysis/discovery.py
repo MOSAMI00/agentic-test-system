@@ -90,6 +90,8 @@ class _ImportMap:
     def add_module_import(self, module_path: str, alias: Optional[str] = None) -> None:
         local_name = alias if alias else module_path.split(".")[-1]
         self.modules[local_name] = module_path
+        if not alias:
+            self.modules[module_path] = module_path
 
     def add_symbol_import(self, module_path: str, symbol_name: str, alias: Optional[str] = None) -> None:
         local_name = alias if alias else symbol_name
@@ -349,7 +351,9 @@ class TestDiscovery:
             if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
                 target_str = call.args[0].value
                 for qualname in symbol_index:
-                    if target_str == qualname or target_str.endswith("." + qualname.split(".")[-1]):
+                    if target_str == qualname:
+                        return qualname
+                    if "." in target_str and (qualname.endswith("." + target_str) or target_str.endswith("." + qualname)):
                         return qualname
 
         # Check patch.object: patch.object(TargetClass, "method")
@@ -380,13 +384,23 @@ class TestDiscovery:
             if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
                 target_str = call.args[0].value
                 for qualname in symbol_index:
-                    if target_str == qualname or target_str.endswith("." + qualname.split(".")[-1]):
+                    if target_str == qualname:
+                        return qualname
+                    if "." in target_str and (qualname.endswith("." + target_str) or target_str.endswith("." + qualname)):
                         return qualname
             elif len(call.args) >= 2 and isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str):
                 target_attr = call.args[1].value
+                target_obj_name = self._get_call_func_name(call.args[0])
+                if target_obj_name in import_map.symbols:
+                    target_obj_name = import_map.symbols[target_obj_name][1]
+                elif target_obj_name in import_map.modules:
+                    target_obj_name = import_map.modules[target_obj_name]
                 for qualname in symbol_index:
-                    if qualname.split(".")[-1] == target_attr:
-                        return qualname
+                    sym_mod = qualname.rsplit(".", 1)[0] if "." in qualname else ""
+                    sym_name = qualname.split(".")[-1]
+                    if sym_name == target_attr and target_obj_name:
+                        if sym_mod == target_obj_name or sym_mod.endswith("." + target_obj_name) or target_obj_name.endswith("." + sym_mod):
+                            return qualname
 
         # mocker.patch / mocker.patch.object
         if func_name in ("mocker.patch", "mocker.patch.object"):
@@ -477,7 +491,7 @@ class TestDiscovery:
                         for qualname, sym in symbol_index.items():
                             sym_mod = qualname.rsplit(".", 1)[0] if "." in qualname else ""
                             sym_name = qualname.split(".")[-1]
-                            if sym_name == orig_name and (not sym_mod or sym_mod.endswith(mod_path) or mod_path.endswith(sym_mod)):
+                            if sym_name == orig_name and self._modules_match(sym_mod, mod_path):
                                 evidence = EvidenceKind.ALIASED_CALL if call_name != orig_name else EvidenceKind.DIRECT_CALL
                                 is_awaited = self._is_awaited_call(item, node)
                                 if is_awaited:
@@ -506,30 +520,36 @@ class TestDiscovery:
                 # 2. Module-qualified or receiver method call: mod.func(...) or obj.method(...)
                 elif isinstance(item.func, ast.Attribute):
                     attr_name = item.func.attr
+                    receiver_expr = self._get_attribute_chain(item.func.value)
 
-                    # Check if value is a simple module alias
-                    if isinstance(item.func.value, ast.Name):
-                        receiver_id = item.func.value.id
-                        # Check module qualified: mod.func(...)
-                        if receiver_id in import_map.modules:
-                            mod_path = import_map.modules[receiver_id]
+                    if receiver_expr:
+                        # Check module qualified: mod.func(...) or pkg.mod.func(...)
+                        mod_path = None
+                        if receiver_expr in import_map.modules:
+                            mod_path = import_map.modules[receiver_expr]
+                        elif "." in receiver_expr:
+                            base, sub = receiver_expr.split(".", 1)
+                            if base in import_map.modules:
+                                mod_path = f"{import_map.modules[base]}.{sub}"
+
+                        if mod_path:
                             for qualname, sym in symbol_index.items():
                                 sym_mod = qualname.rsplit(".", 1)[0] if "." in qualname else ""
                                 sym_name = qualname.split(".")[-1]
-                                if sym_name == attr_name and (not sym_mod or sym_mod.endswith(mod_path) or mod_path.endswith(sym_mod)):
+                                if sym_name == attr_name and self._modules_match(sym_mod, mod_path):
                                     is_awaited = self._is_awaited_call(item, node)
                                     evidence = EvidenceKind.AWAITED_CALL if is_awaited else EvidenceKind.MODULE_QUALIFIED_CALL
                                     findings.setdefault(qualname, []).append({
                                         "classification": AssociationClassification.STATICALLY_ASSOCIATED,
                                         "evidence_kind": evidence,
-                                        "reason": f"Direct module-qualified call '{receiver_id}.{attr_name}'",
+                                        "reason": f"Direct module-qualified call '{receiver_expr}.{attr_name}'",
                                         "test_case": test_case_name,
                                         "lineno": call_lineno,
                                     })
 
                         # Check locally instantiated receiver: obj.method(...)
-                        elif receiver_id in local_instances:
-                            target_cls_qualname = local_instances[receiver_id]
+                        elif receiver_expr in local_instances:
+                            target_cls_qualname = local_instances[receiver_expr]
                             target_method_qualname = f"{target_cls_qualname}.{attr_name}"
                             if target_method_qualname in symbol_index:
                                 is_awaited = self._is_awaited_call(item, node)
@@ -537,7 +557,7 @@ class TestDiscovery:
                                 findings.setdefault(target_method_qualname, []).append({
                                     "classification": AssociationClassification.STATICALLY_ASSOCIATED,
                                     "evidence_kind": evidence,
-                                    "reason": f"Direct method call on locally instantiated receiver '{receiver_id}.{attr_name}'",
+                                    "reason": f"Direct method call on locally instantiated receiver '{receiver_expr}.{attr_name}'",
                                     "test_case": test_case_name,
                                     "lineno": call_lineno,
                                 })
@@ -625,6 +645,32 @@ class TestDiscovery:
         if not test_case_name:
             return False
         return simple_name.lower() in test_case_name.lower()
+
+    @staticmethod
+    def _modules_match(sym_mod: str, mod_path: str) -> bool:
+        """
+        Checks if sym_mod strictly matches mod_path on dotted module boundaries.
+        Prevents cross-module false matches (e.g. 'my_pkg_foo' matching 'foo').
+        """
+        if not sym_mod or not mod_path:
+            return sym_mod == mod_path
+        if sym_mod == mod_path:
+            return True
+        return sym_mod.endswith("." + mod_path) or mod_path.endswith("." + sym_mod)
+
+    @staticmethod
+    def _get_attribute_chain(node: ast.AST) -> Optional[str]:
+        """Reconstructs dotted identifier chain from ast.Name / ast.Attribute nodes."""
+        parts: List[str] = []
+        curr: ast.AST = node
+        while isinstance(curr, ast.Attribute):
+            parts.append(curr.attr)
+            curr = curr.value
+        if isinstance(curr, ast.Name):
+            parts.append(curr.id)
+            parts.reverse()
+            return ".".join(parts)
+        return None
 
     def _find_helper_references(
         self,
