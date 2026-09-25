@@ -287,11 +287,10 @@ def test_characterization_deleted_callable_produces_empty_affected_symbols(sampl
     assert plan.rationale == "Python modifications contain no affected callable symbols"
 
 
-def test_characterization_syntax_errors_recorded_and_trigger_route_no_op(sample_git_repo: Path) -> None:
+def test_analysis_service_diff_syntax_error_sets_is_valid_false(sample_git_repo: Path) -> None:
     """
-    Characterization test documenting existing behavior:
-    Syntax errors in modified Python files are recorded in snapshot.syntax_errors,
-    preventing symbol extraction and causing Decision 1 to select ROUTE_NO_OP.
+    Verifies that a syntax error in a Python file touched by the working-tree diff
+    is recorded in snapshot.syntax_errors and marks snapshot.is_valid = False (Decision A).
     """
     calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
     calc_file.write_text("def broken_syntax(:\n", encoding="utf-8")
@@ -304,8 +303,49 @@ def test_characterization_syntax_errors_recorded_and_trigger_route_no_op(sample_
     assert "calc.py" in snapshot.syntax_errors[0]
     # No symbols extracted from malformed file
     assert len(snapshot.affected_symbols) == 0
+    # Decision A: snapshot is marked invalid
+    assert snapshot.is_valid is False
 
-    planner = ExecutionPlanner()
-    plan = planner.plan(snapshot)
-    assert plan.route == WorkflowRoute.ROUTE_NO_OP
-    assert plan.rationale == "Python modifications contain no affected callable symbols"
+
+def test_analysis_service_syntax_error_outside_diff_preserves_is_valid_true(tmp_path: Path) -> None:
+    """
+    Verifies that syntax errors in Python files outside the working-tree diff
+    are treated as non-blocking warnings: recorded in snapshot.syntax_errors,
+    while snapshot.is_valid remains True (Decision A).
+    """
+    repo_dir = tmp_path / "syntax_warn_repo"
+    repo_dir.mkdir()
+    repo = Repo.init(repo_dir)
+
+    src_dir = repo_dir / "src"
+    src_dir.mkdir()
+
+    valid_file = src_dir / "valid.py"
+    valid_file.write_text("def valid_func() -> int:\n    return 42\n", encoding="utf-8")
+
+    malformed_file = src_dir / "malformed.py"
+    malformed_file.write_text("def broken_syntax(:\n", encoding="utf-8")
+
+    repo.index.add(["src/valid.py", "src/malformed.py"])
+    repo.index.commit("Initial commit with valid and malformed files")
+
+    # Modify ONLY valid.py in working tree
+    valid_file.write_text("def valid_func() -> int:\n    return 100\n", encoding="utf-8")
+
+    service = AnalysisService()
+    snapshot = service.analyze(repo_dir)
+
+    # 1. Non-blocking warning recorded for malformed.py
+    assert len(snapshot.syntax_errors) == 1
+    assert "malformed.py" in snapshot.syntax_errors[0]
+
+    # 2. Diff touches ONLY valid.py
+    assert len(snapshot.diff_hunks) == 1
+    assert snapshot.diff_hunks[0].file_path == Path("src/valid.py")
+
+    # 3. Affected symbols extracted from modified valid file
+    affected_names = [s.qualified_name for s in snapshot.affected_symbols]
+    assert any("valid_func" in name for name in affected_names)
+
+    # 4. Decision A: syntax error outside diff does NOT invalidate snapshot
+    assert snapshot.is_valid is True

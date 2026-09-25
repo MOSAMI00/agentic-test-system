@@ -7,7 +7,7 @@ Enforces INV-01 and INV-02: Zero target application code execution during analys
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from agentic_test.analysis.ast_analyzer import PythonASTAnalyzer
 from agentic_test.analysis.discovery import TestDiscovery
@@ -76,6 +76,8 @@ class AnalysisService:
 
         all_symbols: List[SymbolContract] = []
         syntax_errors: List[str] = []
+        diff_files = {hunk.file_path for hunk in diff_hunks}
+        has_diff_syntax_error = False
 
         # Internal analysis union: include tracked Python files and diff-added Python files
         diff_added_files = {
@@ -98,6 +100,8 @@ class AnalysisService:
                 content = abs_path.read_text(encoding="utf-8", errors="replace")
             except OSError as err:
                 syntax_errors.append(f"{rel_path}: {err}")
+                if self._is_file_in_diff(rel_path, diff_files):
+                    has_diff_syntax_error = True
                 continue
 
             try:
@@ -106,9 +110,14 @@ class AnalysisService:
             except SyntaxParsingError as err:
                 # Per-file syntax isolation: record error and continue to valid files
                 syntax_errors.append(f"{rel_path}: {err}")
+                if self._is_file_in_diff(rel_path, diff_files):
+                    has_diff_syntax_error = True
 
         # Intersect parsed symbols with diff hunks
         affected_symbols = analyzer.resolve_affected_symbols(all_symbols, diff_hunks)
+
+        # Snapshot is invalid if any file touched by the working-tree diff contains syntax errors
+        is_valid = not has_diff_syntax_error
 
         return RepositorySnapshot(
             repo_path=repo_path,
@@ -118,9 +127,24 @@ class AnalysisService:
             tracked_files=tuple(tracked_files),
             existing_test_files=tuple(existing_test_files),
             source_tree_hash=source_tree_hash,
-            is_valid=True,
+            is_valid=is_valid,
             created_at=datetime.now(timezone.utc),
             diff_hunks=tuple(diff_hunks),
             affected_symbols=tuple(affected_symbols),
             syntax_errors=tuple(syntax_errors),
         )
+
+    @staticmethod
+    def _is_file_in_diff(file_path: Path, diff_files: Set[Path]) -> bool:
+        """
+        Determines whether file_path matches any file touched by unified diff hunks.
+        Compares both direct Path equality and relative POSIX suffix matches.
+        """
+        if file_path in diff_files:
+            return True
+        p_posix = file_path.as_posix()
+        for df in diff_files:
+            df_posix = df.as_posix()
+            if p_posix == df_posix or p_posix.endswith("/" + df_posix) or df_posix.endswith("/" + p_posix):
+                return True
+        return False
