@@ -262,9 +262,9 @@ def test_end_to_end_analysis_to_execution_plan(sample_git_repo: Path) -> None:
 
 def test_characterization_deleted_callable_produces_empty_affected_symbols(sample_git_repo: Path) -> None:
     """
-    Characterization test documenting existing behavior:
-    Deleting an entire callable leaves it absent from working tree AST, resulting in
-    zero affected symbols and causing Decision 1 to select ROUTE_NO_OP.
+    Verifies that deleting an unreferenced callable leaves affected_symbols empty,
+    populates deleted_symbols via baseline AST reconciliation, and routes to ROUTE_NO_OP
+    with explicit dead-code deletion rationale (Decision B).
     """
     calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
     calc_file.write_text(
@@ -278,13 +278,116 @@ def test_characterization_deleted_callable_produces_empty_affected_symbols(sampl
 
     # Diff hunk records deletion lines
     assert len(snapshot.diff_hunks) == 1
-    # Characterization: working tree AST has no multiply, so affected_symbols is empty
+    # Surviving AST has no multiply, so affected_symbols is empty
     assert len(snapshot.affected_symbols) == 0
+    # Baseline AST reconciliation captures the deleted callable
+    assert len(snapshot.deleted_symbols) == 1
+    assert snapshot.deleted_symbols[0].qualified_name == "pkg.calc.multiply"
 
     planner = ExecutionPlanner()
     plan = planner.plan(snapshot)
     assert plan.route == WorkflowRoute.ROUTE_NO_OP
-    assert plan.rationale == "Python modifications contain no affected callable symbols"
+    assert plan.rationale == "Python modifications contain no surviving affected callable symbols; 1 deleted symbol(s) have no associated tests (dead-code deletion)"
+
+
+def test_analysis_service_reconciles_covered_deleted_callable_routes_to_docker(sample_git_repo: Path) -> None:
+    """
+    Verifies that deleting a callable that has positive static test associations
+    populates deleted_symbols and routes to ROUTE_TO_DOCKER_EXECUTION with the
+    associated test included in existing_tests_to_run (Decision B).
+    """
+    repo = Repo(sample_git_repo)
+    # Add a test covering multiply to baseline
+    test_file = sample_git_repo / "tests" / "test_calc.py"
+    test_file.write_text(
+        "from pkg.calc import add, multiply\n"
+        "\n"
+        "def test_add():\n"
+        "    assert add(1, 2) == 3\n"
+        "\n"
+        "def test_multiply():\n"
+        "    assert multiply(2, 3) == 6\n",
+        encoding="utf-8",
+    )
+    repo.index.add(["tests/test_calc.py"])
+    repo.index.commit("Add test for multiply")
+
+    # Delete multiply from src/pkg/calc.py in working tree
+    calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
+    calc_file.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo, base_commit=repo.head.commit.hexsha)
+
+    assert len(snapshot.affected_symbols) == 0
+    assert len(snapshot.deleted_symbols) == 1
+    assert snapshot.deleted_symbols[0].qualified_name == "pkg.calc.multiply"
+
+    planner = ExecutionPlanner()
+    plan = planner.plan(snapshot)
+    assert plan.route == WorkflowRoute.ROUTE_TO_DOCKER_EXECUTION
+    assert plan.target_symbols == ()
+    assert Path("tests/test_calc.py") in plan.existing_tests_to_run
+    assert "regression execution for 1 deleted symbol(s)" in plan.rationale
+
+
+def test_analysis_service_mixed_deleted_covered_and_surviving_uncovered(sample_git_repo: Path) -> None:
+    """
+    Verifies mixed changes: a deleted covered callable plus a surviving uncovered
+    callable routes to ROUTE_TO_TEST_GENERATION. Target symbols strictly contain only
+    the surviving uncovered callable (deleted symbols never leak into target_symbols),
+    while the test for the deleted callable is included in existing_tests_to_run (Decision B).
+    """
+    repo = Repo(sample_git_repo)
+    # Baseline commit has test covering multiply
+    test_file = sample_git_repo / "tests" / "test_calc.py"
+    test_file.write_text(
+        "from pkg.calc import multiply\n"
+        "\n"
+        "def test_multiply():\n"
+        "    assert multiply(2, 3) == 6\n",
+        encoding="utf-8",
+    )
+    repo.index.add(["tests/test_calc.py"])
+    repo.index.commit("Baseline covering multiply")
+
+    # Working tree: delete multiply, add a new uncovered function power
+    calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
+    calc_file.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n"
+        "\n"
+        "def power(base: int, exp: int) -> int:\n"
+        "    return base ** exp\n",
+        encoding="utf-8",
+    )
+
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo, base_commit=repo.head.commit.hexsha)
+
+    # power is affected surviving; multiply is deleted
+    affected_names = [s.qualified_name for s in snapshot.affected_symbols]
+    deleted_names = [s.qualified_name for s in snapshot.deleted_symbols]
+    assert "pkg.calc.power" in affected_names
+    assert "pkg.calc.multiply" in deleted_names
+
+    planner = ExecutionPlanner()
+    plan = planner.plan(snapshot)
+
+    # Mixed routing: test generation required for power
+    assert plan.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+    target_names = [s.qualified_name for s in plan.target_symbols]
+    assert "pkg.calc.power" in target_names
+    # Invariant: deleted symbol must NEVER enter target_symbols
+    assert "pkg.calc.multiply" not in target_names
+    # Associated test for deleted symbol is preserved in regression tests
+    assert Path("tests/test_calc.py") in plan.existing_tests_to_run
+    assert "1 deleted symbol(s) included in regression tests" in plan.rationale
+
 
 
 def test_analysis_service_diff_syntax_error_sets_is_valid_false(sample_git_repo: Path) -> None:

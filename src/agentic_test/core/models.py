@@ -86,6 +86,7 @@ class RepositorySnapshot(BaseModel):
     # Approved Option A fields with independent immutable tuple defaults
     diff_hunks: Tuple[DiffHunk, ...] = Field(default_factory=tuple)
     affected_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)
+    deleted_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)
     syntax_errors: Tuple[str, ...] = Field(default_factory=tuple)
 
 

@@ -138,6 +138,7 @@ def evaluate_precedence_rules(
     affected_symbols: Sequence[SymbolContract],
     positively_associated_symbols: Set[str],
     symbol_to_test_files: Dict[str, Set[Path]],
+    deleted_symbols: Sequence[SymbolContract] = (),
 ) -> RoutingDecision:
     """
     Evaluates precedence rules in strict authoritative priority order:
@@ -145,9 +146,10 @@ def evaluate_precedence_rules(
 
     Args:
         diff_hunks: Sequence of unified diff change hunks.
-        affected_symbols: Sequence of SymbolContract records overlapping diff hunks.
+        affected_symbols: Sequence of surviving SymbolContract records overlapping diff hunks.
         positively_associated_symbols: Set of symbol qualified names with STATICALLY_ASSOCIATED evidence.
         symbol_to_test_files: Mapping from symbol qualified name to distinct test paths with positive evidence.
+        deleted_symbols: Sequence of SymbolContract records deleted in the working tree diff.
 
     Returns:
         RoutingDecision detailing route, rationale, target symbols, and existing tests to run.
@@ -170,51 +172,101 @@ def evaluate_precedence_rules(
             existing_tests_to_run=(),
         )
 
-    # Decision 1: Python modifications contain zero affected callable symbols
+    # Partition surviving affected symbols into covered vs uncovered
+    surviving_covered: List[SymbolContract] = []
+    surviving_uncovered: List[SymbolContract] = []
+    for sym in affected_symbols:
+        if sym.qualified_name in positively_associated_symbols:
+            surviving_covered.append(sym)
+        else:
+            surviving_uncovered.append(sym)
+
+    # Partition deleted symbols into regression (covered) vs unreferenced (uncovered)
+    deleted_covered: List[SymbolContract] = []
+    deleted_uncovered: List[SymbolContract] = []
+    for sym in deleted_symbols:
+        if sym.qualified_name in positively_associated_symbols:
+            deleted_covered.append(sym)
+        else:
+            deleted_uncovered.append(sym)
+
+    # Decision 1 & Deleted Callable handling when zero surviving affected symbols exist
     if len(affected_symbols) == 0:
+        # Case A: Neither surviving nor deleted callable symbols exist
+        if len(deleted_symbols) == 0:
+            return RoutingDecision(
+                route=WorkflowRoute.ROUTE_NO_OP,
+                rationale="Python modifications contain no affected callable symbols",
+                target_symbols=(),
+                existing_tests_to_run=(),
+            )
+
+        # Case B: Deleted callables possess positive static test associations (regression execution required)
+        if len(deleted_covered) > 0:
+            tests_to_run: Set[Path] = set()
+            for sym in deleted_covered:
+                tests_to_run.update(symbol_to_test_files.get(sym.qualified_name, set()))
+
+            return RoutingDecision(
+                route=WorkflowRoute.ROUTE_TO_DOCKER_EXECUTION,
+                rationale=f"Deleted callables detected with positive static test associations: regression execution for {len(deleted_covered)} deleted symbol(s)",
+                target_symbols=(),
+                existing_tests_to_run=tuple(sorted(tests_to_run, key=lambda p: p.as_posix())),
+            )
+
+        # Case C: All deleted callables are uncovered by existing tests (dead-code deletion)
         return RoutingDecision(
             route=WorkflowRoute.ROUTE_NO_OP,
-            rationale="Python modifications contain no affected callable symbols",
+            rationale=f"Python modifications contain no surviving affected callable symbols; {len(deleted_uncovered)} deleted symbol(s) have no associated tests (dead-code deletion)",
             target_symbols=(),
             existing_tests_to_run=(),
         )
 
-    # Partition affected symbols into covered vs uncovered
-    covered: List[SymbolContract] = []
-    uncovered: List[SymbolContract] = []
+    # Rule P3: All surviving affected symbols covered by existing tests
+    if len(surviving_uncovered) == 0:
+        tests_to_run_p3: Set[Path] = set()
+        for sym in surviving_covered:
+            tests_to_run_p3.update(symbol_to_test_files.get(sym.qualified_name, set()))
+        for sym in deleted_covered:
+            tests_to_run_p3.update(symbol_to_test_files.get(sym.qualified_name, set()))
 
-    for sym in affected_symbols:
-        if sym.qualified_name in positively_associated_symbols:
-            covered.append(sym)
+        if len(deleted_covered) > 0:
+            p3_rationale = (
+                f"All {len(affected_symbols)} surviving affected symbols possess positive static test associations, "
+                f"plus {len(deleted_covered)} deleted symbol(s) with regression tests: regression execution"
+            )
         else:
-            uncovered.append(sym)
-
-    # Rule P3: All affected symbols covered by existing tests
-    if len(uncovered) == 0:
-        # Collect distinct test paths for all covered affected symbols
-        tests_to_run: Set[Path] = set()
-        for sym in covered:
-            tests_to_run.update(symbol_to_test_files.get(sym.qualified_name, set()))
+            p3_rationale = f"All {len(affected_symbols)} affected symbols possess positive static test associations: regression execution"
 
         return RoutingDecision(
             route=WorkflowRoute.ROUTE_TO_DOCKER_EXECUTION,
-            rationale=f"All {len(affected_symbols)} affected symbols possess positive static test associations: regression execution",
+            rationale=p3_rationale,
             target_symbols=(),
-            existing_tests_to_run=tuple(sorted(tests_to_run, key=lambda p: p.as_posix())),
+            existing_tests_to_run=tuple(sorted(tests_to_run_p3, key=lambda p: p.as_posix())),
         )
 
-    # Rule P4: At least one affected symbol lacks positive static test association
-    # Target symbols: only the uncovered affected symbols, ordered structurally
-    ordered_target_symbols = order_symbols_structurally(uncovered)
+    # Rule P4: At least one surviving affected symbol lacks positive static test association
+    # Target symbols: ONLY surviving uncovered affected symbols, ordered structurally.
+    # Deleted symbols are strictly excluded from target_symbols (INV-03 / Constraint 7).
+    ordered_target_symbols = order_symbols_structurally(surviving_uncovered)
 
-    # Regression baselines: distinct test paths for covered affected symbols
     regression_tests: Set[Path] = set()
-    for sym in covered:
+    for sym in surviving_covered:
         regression_tests.update(symbol_to_test_files.get(sym.qualified_name, set()))
+    for sym in deleted_covered:
+        regression_tests.update(symbol_to_test_files.get(sym.qualified_name, set()))
+
+    if len(deleted_covered) > 0:
+        p4_rationale = (
+            f"Uncovered affected symbols detected: test generation required for {len(surviving_uncovered)} of "
+            f"{len(affected_symbols)} symbols; {len(deleted_covered)} deleted symbol(s) included in regression tests"
+        )
+    else:
+        p4_rationale = f"Uncovered affected symbols detected: test generation required for {len(surviving_uncovered)} of {len(affected_symbols)} symbols"
 
     return RoutingDecision(
         route=WorkflowRoute.ROUTE_TO_TEST_GENERATION,
-        rationale=f"Uncovered affected symbols detected: test generation required for {len(uncovered)} of {len(affected_symbols)} symbols",
+        rationale=p4_rationale,
         target_symbols=ordered_target_symbols,
         existing_tests_to_run=tuple(sorted(regression_tests, key=lambda p: p.as_posix())),
     )

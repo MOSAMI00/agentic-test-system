@@ -483,4 +483,23 @@ def test_compute_diff_excludes_binary_files(temp_git_repo: Path) -> None:
     assert raw_bin.read_bytes() == raw_bin_bytes
 
 
+def test_get_file_content_at_commit_success(temp_git_repo: Path) -> None:
+    """
+    Verifies that get_file_content_at_commit retrieves valid file content
+    at a specific commit SHA without host execution (INV-01).
+    """
+    service = GitService(temp_git_repo)
+    head_sha = service.get_head_commit()
+    content = service.get_file_content_at_commit(head_sha, Path("calculator.py"))
+    assert "def add(" in content
 
+
+def test_get_file_content_at_commit_invalid_file_raises_error(temp_git_repo: Path) -> None:
+    """
+    Verifies that attempting to read a non-existent file at a commit SHA
+    raises RepositoryValidationError.
+    """
+    service = GitService(temp_git_repo)
+    head_sha = service.get_head_commit()
+    with pytest.raises(RepositoryValidationError, match="Failed to retrieve file"):
+        service.get_file_content_at_commit(head_sha, Path("non_existent_file.py"))

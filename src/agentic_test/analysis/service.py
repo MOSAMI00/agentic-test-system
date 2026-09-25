@@ -116,6 +116,61 @@ class AnalysisService:
         # Intersect parsed symbols with diff hunks
         affected_symbols = analyzer.resolve_affected_symbols(all_symbols, diff_hunks)
 
+        # Baseline AST reconciliation for deleted callable symbols (Decision B)
+        deleted_symbols: List[SymbolContract] = []
+        files_with_deletions = {
+            hunk.file_path
+            for hunk in diff_hunks
+            if hunk.old_lines > 0 or hunk.change_type in (ChangeType.MODIFIED, ChangeType.DELETED)
+        }
+        surviving_qualnames = {s.qualified_name for s in all_symbols}
+
+        for rel_path in sorted(files_with_deletions):
+            if rel_path.suffix != ".py":
+                continue
+
+            try:
+                base_content = git_svc.get_file_content_at_commit(resolved_base, rel_path)
+            except Exception:
+                continue
+
+            try:
+                base_symbols = analyzer.parse_symbols(rel_path, base_content)
+            except SyntaxParsingError:
+                continue
+
+            # Identify symbols present in baseline AST that are absent from surviving AST
+            file_hunks = [h for h in diff_hunks if self._is_file_in_diff(rel_path, {h.file_path})]
+            for sym in base_symbols:
+                if sym.qualified_name in surviving_qualnames:
+                    continue
+
+                sym_start, sym_end = sym.line_range
+                is_deleted = False
+                for hunk in file_hunks:
+                    if hunk.change_type == ChangeType.DELETED:
+                        is_deleted = True
+                        break
+                    hunk_old_start = hunk.old_start
+                    hunk_old_end = hunk.old_start + max(hunk.old_lines - 1, 0) if hunk.old_lines > 0 else hunk.old_start
+                    if max(sym_start, hunk_old_start) <= min(sym_end, hunk_old_end):
+                        is_deleted = True
+                        break
+
+                if is_deleted:
+                    deleted_symbols.append(
+                        SymbolContract(
+                            qualified_name=sym.qualified_name,
+                            symbol_type=sym.symbol_type,
+                            file_path=sym.file_path,
+                            line_range=sym.line_range,
+                            signature=sym.signature,
+                            docstring=sym.docstring,
+                            dependencies=sym.dependencies,
+                            is_affected=True,
+                        )
+                    )
+
         # Snapshot is invalid if any file touched by the working-tree diff contains syntax errors
         is_valid = not has_diff_syntax_error
 
@@ -131,6 +186,7 @@ class AnalysisService:
             created_at=datetime.now(timezone.utc),
             diff_hunks=tuple(diff_hunks),
             affected_symbols=tuple(affected_symbols),
+            deleted_symbols=tuple(deleted_symbols),
             syntax_errors=tuple(syntax_errors),
         )
 

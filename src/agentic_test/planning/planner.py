@@ -53,8 +53,9 @@ class ExecutionPlanner:
         positively_associated_symbols: Set[str] = set()
         symbol_to_test_files: Dict[str, Set[Path]] = defaultdict(set)
 
-        # Collect static associations only when affected symbols and test files exist
-        if snapshot.affected_symbols and snapshot.existing_test_files:
+        # Collect static associations for surviving affected symbols and deleted symbols (Decision B)
+        all_actionable_symbols = list(snapshot.affected_symbols) + list(snapshot.deleted_symbols)
+        if all_actionable_symbols and snapshot.existing_test_files:
             for test_file in snapshot.existing_test_files:
                 resolved_test_path = (
                     test_file
@@ -64,7 +65,7 @@ class ExecutionPlanner:
 
                 associations = self._test_discovery.analyze_associations(
                     resolved_test_path,
-                    snapshot.affected_symbols,
+                    all_actionable_symbols,
                 )
 
                 for assoc in associations:
@@ -78,6 +79,7 @@ class ExecutionPlanner:
             affected_symbols=snapshot.affected_symbols,
             positively_associated_symbols=positively_associated_symbols,
             symbol_to_test_files=symbol_to_test_files,
+            deleted_symbols=snapshot.deleted_symbols,
         )
 
         # Calculate cryptographic decision hash

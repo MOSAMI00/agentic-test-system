@@ -78,6 +78,7 @@ def _make_snapshot(
     affected_symbols: Tuple[SymbolContract, ...] = (),
     existing_test_files: Tuple[Path, ...] = (),
     source_tree_hash: str = "a" * 64,
+    deleted_symbols: Tuple[SymbolContract, ...] = (),
 ) -> RepositorySnapshot:
     """Helper to create a validated RepositorySnapshot."""
     return RepositorySnapshot(
@@ -92,6 +93,7 @@ def _make_snapshot(
         created_at=datetime.now(timezone.utc),
         diff_hunks=diff_hunks,
         affected_symbols=affected_symbols,
+        deleted_symbols=deleted_symbols,
         syntax_errors=(),
     )
 
@@ -698,3 +700,255 @@ def test_rule_p2_dotfile_modifications_and_symbol_type_module(tmp_path: Path) ->
     assert ordered[0].qualified_name == "srv.func"
     assert ordered[1].qualified_name == "srv"
 
+
+# ---------------------------------------------------------------------------
+# Decision B: Deleted Callable Handling & Precedence Tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_routes_covered_deleted_callable_to_docker_execution(tmp_path: Path) -> None:
+    """
+    Verifies that a deleted callable with a positive static test association
+    routes to ROUTE_TO_DOCKER_EXECUTION with empty target_symbols, test file in
+    existing_tests_to_run, and explicit regression rationale (Decision B).
+    """
+    sym_deleted = SymbolContract(
+        qualified_name="calc.mul",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(10, 15),
+        signature="def mul(a, b)",
+        is_affected=True,
+    )
+    diff = _make_diff_hunk(file_path=Path("src/calc.py"), old_lines=5, new_lines=0)
+    test_file_mul = Path("tests/test_mul.py")
+
+    assoc_mul = StaticAssociation(
+        target_symbol="calc.mul",
+        test_file_path=test_file_mul,
+        classification=AssociationClassification.STATICALLY_ASSOCIATED,
+        evidence_kind=EvidenceKind.DIRECT_CALL,
+        reason="Direct call to deleted mul",
+    )
+
+    mock_discovery = MockTestDiscovery([assoc_mul])
+    planner = ExecutionPlanner(test_discovery=mock_discovery)
+
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(diff,),
+        affected_symbols=(),
+        deleted_symbols=(sym_deleted,),
+        existing_test_files=(test_file_mul,),
+    )
+    plan = planner.plan(snapshot)
+
+    assert plan.route == WorkflowRoute.ROUTE_TO_DOCKER_EXECUTION
+    assert plan.target_symbols == ()
+    assert plan.existing_tests_to_run == (test_file_mul,)
+    assert plan.rationale == "Deleted callables detected with positive static test associations: regression execution for 1 deleted symbol(s)"
+
+
+def test_planner_mixed_deleted_covered_and_surviving_uncovered_symbols(tmp_path: Path) -> None:
+    """
+    Verifies mixed changes: surviving uncovered callable triggers ROUTE_TO_TEST_GENERATION.
+    Target symbols contains ONLY the surviving uncovered callable (deleted symbols are strictly excluded),
+    and the regression test for the covered deleted callable is retained in existing_tests_to_run (Decision B).
+    """
+    sym_uncovered = SymbolContract(
+        qualified_name="calc.power",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(20, 25),
+        signature="def power(b, e)",
+        is_affected=True,
+    )
+    sym_deleted = SymbolContract(
+        qualified_name="calc.mul",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(10, 15),
+        signature="def mul(a, b)",
+        is_affected=True,
+    )
+    diff = _make_diff_hunk(file_path=Path("src/calc.py"), old_lines=5, new_lines=5)
+    test_file_mul = Path("tests/test_mul.py")
+
+    assoc_mul = StaticAssociation(
+        target_symbol="calc.mul",
+        test_file_path=test_file_mul,
+        classification=AssociationClassification.STATICALLY_ASSOCIATED,
+        evidence_kind=EvidenceKind.DIRECT_CALL,
+        reason="Direct call to mul",
+    )
+
+    mock_discovery = MockTestDiscovery([assoc_mul])
+    planner = ExecutionPlanner(test_discovery=mock_discovery)
+
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(diff,),
+        affected_symbols=(sym_uncovered,),
+        deleted_symbols=(sym_deleted,),
+        existing_test_files=(test_file_mul,),
+    )
+    plan = planner.plan(snapshot)
+
+    assert plan.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+    assert plan.target_symbols == (sym_uncovered,)
+    assert sym_deleted not in plan.target_symbols
+    assert plan.existing_tests_to_run == (test_file_mul,)
+    assert "Uncovered affected symbols detected: test generation required for 1 of 1 symbols; 1 deleted symbol(s) included in regression tests" in plan.rationale
+
+
+def test_planner_mixed_deleted_covered_and_surviving_covered_symbols(tmp_path: Path) -> None:
+    """
+    Verifies that when all surviving affected symbols and deleted symbols are covered,
+    ROUTE_TO_DOCKER_EXECUTION is selected and tests for both surviving and deleted
+    symbols are combined in existing_tests_to_run.
+    """
+    sym_add = SymbolContract(
+        qualified_name="calc.add",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(1, 5),
+        signature="def add(a, b)",
+        is_affected=True,
+    )
+    sym_deleted = SymbolContract(
+        qualified_name="calc.mul",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(10, 15),
+        signature="def mul(a, b)",
+        is_affected=True,
+    )
+    diff = _make_diff_hunk(file_path=Path("src/calc.py"), old_lines=5, new_lines=5)
+    test_add = Path("tests/test_add.py")
+    test_mul = Path("tests/test_mul.py")
+
+    assoc_add = StaticAssociation(
+        target_symbol="calc.add",
+        test_file_path=test_add,
+        classification=AssociationClassification.STATICALLY_ASSOCIATED,
+        evidence_kind=EvidenceKind.DIRECT_CALL,
+        reason="Direct call to add",
+    )
+    assoc_mul = StaticAssociation(
+        target_symbol="calc.mul",
+        test_file_path=test_mul,
+        classification=AssociationClassification.STATICALLY_ASSOCIATED,
+        evidence_kind=EvidenceKind.DIRECT_CALL,
+        reason="Direct call to mul",
+    )
+
+    mock_discovery = MockTestDiscovery([assoc_add, assoc_mul])
+    planner = ExecutionPlanner(test_discovery=mock_discovery)
+
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(diff,),
+        affected_symbols=(sym_add,),
+        deleted_symbols=(sym_deleted,),
+        existing_test_files=(test_add, test_mul),
+    )
+    plan = planner.plan(snapshot)
+
+    assert plan.route == WorkflowRoute.ROUTE_TO_DOCKER_EXECUTION
+    assert plan.target_symbols == ()
+    assert plan.existing_tests_to_run == (test_add, test_mul)
+    assert plan.rationale == (
+        "All 1 surviving affected symbols possess positive static test associations, "
+        "plus 1 deleted symbol(s) with regression tests: regression execution"
+    )
+
+
+def test_planner_uncovered_deleted_callable_routes_to_no_op_with_explicit_rationale(tmp_path: Path) -> None:
+    """
+    Verifies that deleted callables with zero positive test associations route to
+    ROUTE_NO_OP with explicit dead-code deletion rationale (Decision B / Constraint 10).
+    """
+    sym_deleted = SymbolContract(
+        qualified_name="calc.mul",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(10, 15),
+        signature="def mul(a, b)",
+        is_affected=True,
+    )
+    diff = _make_diff_hunk(file_path=Path("src/calc.py"), old_lines=5, new_lines=0)
+    mock_discovery = MockTestDiscovery([])
+    planner = ExecutionPlanner(test_discovery=mock_discovery)
+
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(diff,),
+        affected_symbols=(),
+        deleted_symbols=(sym_deleted,),
+        existing_test_files=(Path("tests/test_other.py"),),
+    )
+    plan = planner.plan(snapshot)
+
+    assert plan.route == WorkflowRoute.ROUTE_NO_OP
+    assert plan.target_symbols == ()
+    assert plan.existing_tests_to_run == ()
+    assert plan.rationale == "Python modifications contain no surviving affected callable symbols; 1 deleted symbol(s) have no associated tests (dead-code deletion)"
+
+
+def test_deleted_symbols_never_leak_into_target_symbols(tmp_path: Path) -> None:
+    """
+    Invariant check (INV-03 / Constraint 7):
+    Deleted symbols must never enter target_symbols, even when multiple covered
+    and uncovered deleted symbols are present.
+    """
+    sym_surviving_uncovered = SymbolContract(
+        qualified_name="calc.div",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(30, 35),
+        signature="def div(a, b)",
+        is_affected=True,
+    )
+    del_1 = SymbolContract(
+        qualified_name="calc.sub",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(5, 10),
+        signature="def sub(a, b)",
+        is_affected=True,
+    )
+    del_2 = SymbolContract(
+        qualified_name="calc.mul",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(10, 15),
+        signature="def mul(a, b)",
+        is_affected=True,
+    )
+    diff = _make_diff_hunk(file_path=Path("src/calc.py"), old_lines=15, new_lines=5)
+    test_sub = Path("tests/test_sub.py")
+
+    assoc_sub = StaticAssociation(
+        target_symbol="calc.sub",
+        test_file_path=test_sub,
+        classification=AssociationClassification.STATICALLY_ASSOCIATED,
+        evidence_kind=EvidenceKind.DIRECT_CALL,
+        reason="Direct call to sub",
+    )
+
+    mock_discovery = MockTestDiscovery([assoc_sub])
+    planner = ExecutionPlanner(test_discovery=mock_discovery)
+
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(diff,),
+        affected_symbols=(sym_surviving_uncovered,),
+        deleted_symbols=(del_1, del_2),
+        existing_test_files=(test_sub,),
+    )
+    plan = planner.plan(snapshot)
+
+    assert plan.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+    assert plan.target_symbols == (sym_surviving_uncovered,)
+    assert del_1 not in plan.target_symbols
+    assert del_2 not in plan.target_symbols

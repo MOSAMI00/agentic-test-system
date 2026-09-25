@@ -170,6 +170,22 @@ class GitService:
             return head.parents[0].hexsha
         return head.hexsha
 
+    def get_file_content_at_commit(self, commit_sha: str, rel_path: Path) -> str:
+        """
+        Retrieves UTF-8 content of a tracked file at a specific Git commit SHA.
+        FR-01 / FR-02: Reads from git show <commit_sha>:<posix_path> without executing code.
+        """
+        repo = self._get_repo()
+        posix_path = rel_path.as_posix()
+        try:
+            content: str = repo.git.show(f"{commit_sha}:{posix_path}")
+            return content
+        except GitError as exc:
+            raise RepositoryValidationError(
+                f"Failed to retrieve file '{rel_path}' at commit '{commit_sha}': {exc}"
+            ) from exc
+
+
     def list_tracked_files(self) -> List[Path]:
         """
         Lists all files currently tracked by Git in the repository, excluding virtualenvs, caches, etc.
