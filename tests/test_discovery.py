@@ -720,3 +720,59 @@ def test_module_qualified_chained_attribute_call(tmp_path: Path) -> None:
     assert assocs[0].classification == AssociationClassification.STATICALLY_ASSOCIATED
     assert assocs[0].evidence_kind == EvidenceKind.MODULE_QUALIFIED_CALL
 
+
+def test_modules_match_directional_precision_prevents_shallower_symbol_match(tmp_path: Path) -> None:
+    """
+    Verifies that importing a deeper module 'from common.helpers import run'
+    strictly associates with 'common.helpers.run' (exact) or 'src.common.helpers.run' (valid suffix),
+    and NEVER falsely matches a shallower root symbol 'helpers.run'.
+    """
+    test_file = tmp_path / "test_common.py"
+    test_file.write_text(
+        "from common.helpers import run\n"
+        "\n"
+        "def test_run():\n"
+        "    run()\n",
+        encoding="utf-8",
+    )
+
+    sym_shallower = SymbolContract(
+        qualified_name="helpers.run",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("helpers.py"),
+        line_range=(1, 5),
+        signature="def run()",
+    )
+    sym_exact = SymbolContract(
+        qualified_name="common.helpers.run",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("common/helpers.py"),
+        line_range=(1, 5),
+        signature="def run()",
+    )
+    sym_prefixed = SymbolContract(
+        qualified_name="src.common.helpers.run",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/common/helpers.py"),
+        line_range=(1, 5),
+        signature="def run()",
+    )
+
+    discovery = TestDiscovery()
+    assocs = discovery.analyze_associations(test_file, [sym_shallower, sym_exact, sym_prefixed])
+
+    matched_targets = {
+        a.target_symbol
+        for a in assocs
+        if a.classification == AssociationClassification.STATICALLY_ASSOCIATED
+    }
+
+    # Exact module match must succeed
+    assert "common.helpers.run" in matched_targets
+
+    # Valid prefix/suffix match (e.g. repo src root) must succeed
+    assert "src.common.helpers.run" in matched_targets
+
+    # Shallower root symbol must NOT match (false-positive prevented)
+    assert "helpers.run" not in matched_targets
+

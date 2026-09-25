@@ -13,7 +13,16 @@ from agentic_test.analysis.ast_analyzer import PythonASTAnalyzer
 from agentic_test.analysis.discovery import TestDiscovery
 from agentic_test.analysis.git_service import GitService
 from agentic_test.analysis.service import AnalysisService
-from agentic_test.core.models import RepositorySnapshot, SymbolContract, SymbolType
+from agentic_test.core.models import (
+    ChangeType,
+    ExecutionPlan,
+    RepositorySnapshot,
+    SymbolContract,
+    SymbolType,
+    WorkflowRoute,
+)
+from agentic_test.planning.planner import ExecutionPlanner
+from agentic_test.planning.rules import compute_decision_hash
 
 
 @pytest.fixture
@@ -162,3 +171,141 @@ def test_analysis_service_dependency_injection(sample_git_repo: Path) -> None:
     )
     snapshot = service.analyze(sample_git_repo)
     assert snapshot.is_valid is True
+
+
+def test_analysis_service_diff_added_untracked_python_files_parsed_and_populates_affected_symbols(
+    sample_git_repo: Path,
+) -> None:
+    """
+    Verifies that Python files represented by ADDED diff hunks (untracked in Git)
+    are included in AST analysis and populate affected_symbols, while preserving
+    strict Git semantics for snapshot.tracked_files (FR-02, FR-03, FR-04).
+    """
+    new_file = sample_git_repo / "src" / "pkg" / "new_feature.py"
+    new_file.write_text(
+        "def calculate_tax(amount: float) -> float:\n"
+        "    return amount * 0.2\n",
+        encoding="utf-8",
+    )
+    # File is NOT staged (git add) -> untracked in Git index
+
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo)
+
+    # 1. Tracked files preserves strict git ls-files semantics
+    assert Path("src/pkg/new_feature.py") not in snapshot.tracked_files
+
+    # 2. Diff hunks contains the ADDED hunk
+    added_hunks = [
+        h for h in snapshot.diff_hunks
+        if h.file_path == Path("src/pkg/new_feature.py") and h.change_type == ChangeType.ADDED
+    ]
+    assert len(added_hunks) == 1
+
+    # 3. Affected symbols contains the callable from the untracked file
+    affected_names = [s.qualified_name for s in snapshot.affected_symbols]
+    assert "pkg.new_feature.calculate_tax" in affected_names
+
+
+def test_end_to_end_analysis_to_execution_plan(sample_git_repo: Path) -> None:
+    """
+    End-to-end integration test:
+    Real Git working tree change -> AnalysisService.analyze() -> TestDiscovery -> ExecutionPlanner.plan().
+    Verifies pipeline integrity across Layers 1, 2, and 3 without mock fixtures.
+    """
+    calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
+    calc_file.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b + 0\n"
+        "\n"
+        "def multiply(a: int, b: int) -> int:\n"
+        "    return a * b * 1\n",
+        encoding="utf-8",
+    )
+
+    # Ingest and analyze working tree
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo)
+
+    # Plan execution using real TestDiscovery
+    planner = ExecutionPlanner(TestDiscovery())
+    plan = planner.plan(snapshot)
+
+    # 1. Route verification: uncovered symbol triggers test generation
+    assert plan.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+
+    # 2. Affected symbols in snapshot: both modified callables detected
+    affected_names = {s.qualified_name for s in snapshot.affected_symbols}
+    assert "pkg.calc.add" in affected_names
+    assert "pkg.calc.multiply" in affected_names
+
+    # 3. Target symbols in plan: only uncovered symbol requiring synthesis
+    target_names = [s.qualified_name for s in plan.target_symbols]
+    assert "pkg.calc.multiply" in target_names
+    assert "pkg.calc.add" not in target_names
+
+    # 4. Existing tests to run: regression baseline for covered symbol
+    existing_tests = [p.as_posix() for p in plan.existing_tests_to_run]
+    assert any("test_calc.py" in p for p in existing_tests)
+
+    # 5. Cryptographic decision hash verification
+    expected_hash = compute_decision_hash(
+        source_tree_hash=snapshot.source_tree_hash,
+        route=plan.route,
+        rationale=plan.rationale,
+        target_symbols=plan.target_symbols,
+        existing_tests_to_run=plan.existing_tests_to_run,
+    )
+    assert plan.decision_hash == expected_hash
+    assert len(plan.decision_hash) == 64
+
+
+def test_characterization_deleted_callable_produces_empty_affected_symbols(sample_git_repo: Path) -> None:
+    """
+    Characterization test documenting existing behavior:
+    Deleting an entire callable leaves it absent from working tree AST, resulting in
+    zero affected symbols and causing Decision 1 to select ROUTE_NO_OP.
+    """
+    calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
+    calc_file.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo)
+
+    # Diff hunk records deletion lines
+    assert len(snapshot.diff_hunks) == 1
+    # Characterization: working tree AST has no multiply, so affected_symbols is empty
+    assert len(snapshot.affected_symbols) == 0
+
+    planner = ExecutionPlanner()
+    plan = planner.plan(snapshot)
+    assert plan.route == WorkflowRoute.ROUTE_NO_OP
+    assert plan.rationale == "Python modifications contain no affected callable symbols"
+
+
+def test_characterization_syntax_errors_recorded_and_trigger_route_no_op(sample_git_repo: Path) -> None:
+    """
+    Characterization test documenting existing behavior:
+    Syntax errors in modified Python files are recorded in snapshot.syntax_errors,
+    preventing symbol extraction and causing Decision 1 to select ROUTE_NO_OP.
+    """
+    calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
+    calc_file.write_text("def broken_syntax(:\n", encoding="utf-8")
+
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo)
+
+    # Syntax error recorded in snapshot.syntax_errors
+    assert len(snapshot.syntax_errors) == 1
+    assert "calc.py" in snapshot.syntax_errors[0]
+    # No symbols extracted from malformed file
+    assert len(snapshot.affected_symbols) == 0
+
+    planner = ExecutionPlanner()
+    plan = planner.plan(snapshot)
+    assert plan.route == WorkflowRoute.ROUTE_NO_OP
+    assert plan.rationale == "Python modifications contain no affected callable symbols"

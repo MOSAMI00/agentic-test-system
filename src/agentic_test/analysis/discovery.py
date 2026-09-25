@@ -353,7 +353,7 @@ class TestDiscovery:
                 for qualname in symbol_index:
                     if target_str == qualname:
                         return qualname
-                    if "." in target_str and (qualname.endswith("." + target_str) or target_str.endswith("." + qualname)):
+                    if "." in target_str and qualname.endswith("." + target_str):
                         return qualname
 
         # Check patch.object: patch.object(TargetClass, "method")
@@ -386,7 +386,7 @@ class TestDiscovery:
                 for qualname in symbol_index:
                     if target_str == qualname:
                         return qualname
-                    if "." in target_str and (qualname.endswith("." + target_str) or target_str.endswith("." + qualname)):
+                    if "." in target_str and qualname.endswith("." + target_str):
                         return qualname
             elif len(call.args) >= 2 and isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str):
                 target_attr = call.args[1].value
@@ -399,7 +399,7 @@ class TestDiscovery:
                     sym_mod = qualname.rsplit(".", 1)[0] if "." in qualname else ""
                     sym_name = qualname.split(".")[-1]
                     if sym_name == target_attr and target_obj_name:
-                        if sym_mod == target_obj_name or sym_mod.endswith("." + target_obj_name) or target_obj_name.endswith("." + sym_mod):
+                        if self._modules_match(sym_mod, target_obj_name):
                             return qualname
 
         # mocker.patch / mocker.patch.object
@@ -650,13 +650,14 @@ class TestDiscovery:
     def _modules_match(sym_mod: str, mod_path: str) -> bool:
         """
         Checks if sym_mod strictly matches mod_path on dotted module boundaries.
-        Prevents cross-module false matches (e.g. 'my_pkg_foo' matching 'foo').
+        Allows mod_path to match an exact module or a valid suffix of sym_mod (e.g. 'pkg.mod' matching 'src.pkg.mod'),
+        while preventing deeper imported modules from falsely matching shallower symbols.
         """
         if not sym_mod or not mod_path:
             return sym_mod == mod_path
         if sym_mod == mod_path:
             return True
-        return sym_mod.endswith("." + mod_path) or mod_path.endswith("." + sym_mod)
+        return sym_mod.endswith("." + mod_path)
 
     @staticmethod
     def _get_attribute_chain(node: ast.AST) -> Optional[str]:

@@ -12,7 +12,7 @@ from typing import List, Optional
 from agentic_test.analysis.ast_analyzer import PythonASTAnalyzer
 from agentic_test.analysis.discovery import TestDiscovery
 from agentic_test.analysis.git_service import GitService
-from agentic_test.core.models import RepositorySnapshot, SymbolContract
+from agentic_test.core.models import ChangeType, RepositorySnapshot, SymbolContract
 from agentic_test.core.protocols.analyzer import CodeAnalyzer, SyntaxParsingError
 
 
@@ -77,8 +77,16 @@ class AnalysisService:
         all_symbols: List[SymbolContract] = []
         syntax_errors: List[str] = []
 
-        # Traverse tracked Python files and parse symbols statically
-        for rel_path in tracked_files:
+        # Internal analysis union: include tracked Python files and diff-added Python files
+        diff_added_files = {
+            hunk.file_path
+            for hunk in diff_hunks
+            if hunk.change_type == ChangeType.ADDED and hunk.file_path.suffix == ".py"
+        }
+        analyzable_files = sorted(set(tracked_files) | diff_added_files)
+
+        # Traverse analyzable Python files and parse symbols statically
+        for rel_path in analyzable_files:
             if rel_path.suffix != ".py":
                 continue
 
