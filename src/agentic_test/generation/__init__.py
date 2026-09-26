@@ -10,6 +10,7 @@ from agentic_test.generation.exceptions import (
     LLMCommunicationError,
     SchemaValidationError,
 )
+from agentic_test.generation.litellm_service import LiteLLMService, RunBudgetTracker
 from agentic_test.generation.mock_llm import MockLLMService
 from agentic_test.generation.schemas import CandidateSynthesisSchema
 from agentic_test.generation.service import GenerationService
@@ -17,6 +18,8 @@ from agentic_test.generation.service import GenerationService
 __all__ = [
     "GenerationService",
     "MockLLMService",
+    "LiteLLMService",
+    "RunBudgetTracker",
     "ContextAssembler",
     "GenerationContext",
     "CandidateSynthesisSchema",
