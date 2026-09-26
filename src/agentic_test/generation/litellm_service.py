@@ -80,6 +80,7 @@ class LiteLLMService(LLMService):
         allow_external_transmission: bool = False,
         budget_tracker: Optional[RunBudgetTracker] = None,
         max_retries: int = 2,
+        timeout: float = 30.0,
     ) -> None:
         self._model: str = model
         self._allow_external_transmission: bool = allow_external_transmission
@@ -91,6 +92,7 @@ class LiteLLMService(LLMService):
             budget_tracker if budget_tracker is not None else RunBudgetTracker(max_requests=5)
         )
         self._max_retries: int = max_retries
+        self._timeout: float = timeout
 
         # Suppress LiteLLM console output and telemetry
         litellm.telemetry = False
@@ -111,6 +113,11 @@ class LiteLLMService(LLMService):
     def budget_tracker(self) -> RunBudgetTracker:
         """Run-scoped budget tracker."""
         return self._budget_tracker
+
+    @property
+    def timeout(self) -> float:
+        """Configured request timeout in seconds."""
+        return self._timeout
 
     @staticmethod
     def _is_local_model(model: str) -> bool:
@@ -222,6 +229,7 @@ class LiteLLMService(LLMService):
                     max_tokens=max_tokens,
                     response_format=response_format,
                     api_key=api_key_str,
+                    timeout=self._timeout,
                     num_retries=0,
                     **{"no-log": True},
                 )

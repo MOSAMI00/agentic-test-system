@@ -7,10 +7,11 @@ refusal handling, error handling, retries, and request caps without network call
 import os
 from pathlib import Path
 import socket
+import tempfile
 from typing import Any, Generator
 from unittest.mock import MagicMock, patch
 import pytest
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, SecretStr, ValidationError
 
 import litellm
 from litellm.exceptions import (
@@ -29,6 +30,7 @@ from agentic_test.core.models import (
     WorkflowRoute,
 )
 from agentic_test.core.protocols.llm import LLMService
+from agentic_test.generation.context import ContextAssembler
 from agentic_test.generation.exceptions import LLMCommunicationError, SchemaValidationError
 from agentic_test.generation.litellm_service import LiteLLMService, RunBudgetTracker
 from agentic_test.generation.schemas import CandidateSynthesisSchema
@@ -298,20 +300,65 @@ def test_strict_schema_payload_structure() -> None:
         assert kwargs["model"] == "gpt-4o-mini"
         assert kwargs["temperature"] == 0.0
         assert kwargs["max_tokens"] == 1024
+        assert kwargs["timeout"] == 30.0
         assert kwargs["num_retries"] == 0
         assert kwargs["no-log"] is True
         assert kwargs["messages"] == [
             {"role": "system", "content": "Follow constraints"},
             {"role": "user", "content": "Generate a test"},
         ]
-        assert kwargs["response_format"] == {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "CandidateSynthesisSchema",
-                "schema": CandidateSynthesisSchema.model_json_schema(),
-                "strict": True,
-            },
-        }
+
+        resp_format = kwargs["response_format"]
+        assert resp_format["type"] == "json_schema"
+        assert resp_format["json_schema"]["strict"] is True
+        assert resp_format["json_schema"]["name"] == "CandidateSynthesisSchema"
+
+        schema = resp_format["json_schema"]["schema"]
+        assert schema["additionalProperties"] is False
+        assert set(schema["required"]) == {"imports", "test_code", "rationale", "mock_targets"}
+        assert schema["properties"]["rationale"]["description"] == (
+            "Concise engineering justification for the test scenario and assertions."
+        )
+
+
+def test_custom_timeout_forwarded_to_completion() -> None:
+    """Verifies that a custom timeout passed to LiteLLMService constructor is forwarded to litellm.completion."""
+    service = LiteLLMService(
+        model="gpt-4o-mini",
+        api_key=SecretStr("sk-dummy"),
+        allow_external_transmission=True,
+        timeout=12.5,
+    )
+    assert service.timeout == 12.5
+
+    mock_resp = _create_mock_response('{"name": "test_timeout", "score": 99}')
+    with patch("litellm.completion", return_value=mock_resp) as mock_completion:
+        service.generate_structured("prompt", "system", SimpleTestSchema)
+        _, kwargs = mock_completion.call_args
+        assert kwargs["timeout"] == 12.5
+
+
+def test_candidate_synthesis_schema_empty_arrays_and_extra_forbidden() -> None:
+    """Verifies that empty imports/mock_targets are accepted and unexpected extra fields are rejected."""
+    # 1. Valid payload with empty arrays
+    valid_json = (
+        '{"imports": [], "test_code": "def test_add(): assert 1 == 1", '
+        '"rationale": "Justification", "mock_targets": []}'
+    )
+    parsed = CandidateSynthesisSchema.model_validate_json(valid_json)
+    assert parsed.imports == ()
+    assert parsed.mock_targets == ()
+    assert parsed.test_code == "def test_add(): assert 1 == 1"
+    assert parsed.rationale == "Justification"
+
+    # 2. Rejection of unexpected extra property
+    extra_json = (
+        '{"imports": [], "test_code": "def test_add(): assert 1 == 1", '
+        '"rationale": "Justification", "mock_targets": [], "unexpected_field": 42}'
+    )
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        CandidateSynthesisSchema.model_validate_json(extra_json)
+
 
 
 # =========================================================================
@@ -630,3 +677,56 @@ def test_generation_service_with_litellm_adapter_offline() -> None:
         assert cand.quarantine_reason is None
         assert "assert multiply(2, 3) == 6" in cand.candidate_code
         assert "import pytest" in cand.imports
+
+
+# =========================================================================
+# 11. Synthetic Source Fixture with Real Body
+# =========================================================================
+
+def test_synthetic_source_fixture_with_real_body() -> None:
+    """
+    Verifies that an isolated synthetic fixture outside the application source tree
+    produces the exact prompt containing the real 'return a + b' body,
+    relative path only, and zero host paths or project source code.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        src_dir = tmp_path / "src"
+        src_dir.mkdir(parents=True)
+        toy_file = src_dir / "toy_math.py"
+        toy_file.write_text(
+            "def add(a: int, b: int) -> int:\n"
+            "    return a + b\n",
+            encoding="utf-8",
+        )
+
+        toy_symbol = SymbolContract(
+            qualified_name="toy_math.add",
+            symbol_type=SymbolType.FUNCTION,
+            file_path=Path("src/toy_math.py"),
+            line_range=(1, 2),
+            signature="def add(a: int, b: int) -> int",
+            docstring="",
+            dependencies=(),
+            is_affected=True,
+        )
+
+        assembler = ContextAssembler()
+        ctx = assembler.assemble(target_symbol=toy_symbol, repo_root=tmp_path)
+        prompt = assembler.format_prompt(ctx)
+
+        # 1. Target symbol and uppercase symbol type
+        assert "Target Symbol: toy_math.add (FUNCTION)" in prompt
+        assert "Signature: def add(a: int, b: int) -> int" in prompt
+
+        # 2. Relative file path only (no absolute host paths leaked)
+        assert "Source File: src" in prompt
+        assert str(tmp_path) not in prompt
+        assert "agentic-test-system" not in prompt
+
+        # 3. Real body included
+        assert "return a + b" in prompt
+
+        # 4. No project source or git history
+        assert "agentic_test" not in prompt
+        assert "Unified Diff:\nNo diff hunks recorded." in prompt
