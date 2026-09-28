@@ -38,6 +38,19 @@ class ValidationPipeline:
     def validators(self) -> List[BaseValidator]:
         return self._validators
 
+    @staticmethod
+    def _reconstruct_candidate(
+        candidate: TestCandidate, status: ValidationStatus
+    ) -> TestCandidate:
+        """
+        Reconstructs a TestCandidate with an updated validation_status via validated
+        instantiation to prevent validation bypass (such as from model_copy).
+        Preserves all candidate fields, identity, retry_count, and quarantine_reason.
+        """
+        return TestCandidate(
+            **{**candidate.__dict__, "validation_status": status}
+        )
+
     def validate_candidate(
         self, candidate: TestCandidate
     ) -> Tuple[TestCandidate, ValidationResult]:
@@ -59,10 +72,8 @@ class ValidationPipeline:
         for validator in self._validators:
             result = validator.validate(candidate)
             if not result.passed:
-                # Update candidate validation status to match rejected gate
-                updated_candidate = candidate.model_copy(
-                    update={"validation_status": result.status}
-                )
+                # Update candidate validation status to match rejected gate via validated reconstruction
+                updated_candidate = self._reconstruct_candidate(candidate, result.status)
                 return updated_candidate, result
 
         # All static gates passed
@@ -72,9 +83,7 @@ class ValidationPipeline:
             gate="STATIC_PIPELINE",
             passed=True,
         )
-        updated_candidate = candidate.model_copy(
-            update={"validation_status": ValidationStatus.PASSED}
-        )
+        updated_candidate = self._reconstruct_candidate(candidate, ValidationStatus.PASSED)
         return updated_candidate, passed_result
 
     def validate_candidates(

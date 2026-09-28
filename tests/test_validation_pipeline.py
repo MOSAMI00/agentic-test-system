@@ -6,6 +6,7 @@ and ValidationPipeline short-circuiting.
 
 from pathlib import Path
 import pytest
+from pydantic import ValidationError
 
 from agentic_test.core.models import TestCandidate, ValidationStatus
 from agentic_test.validation.base import BaseValidator
@@ -314,3 +315,135 @@ def test_validation_pipeline_gate_3_blocked_invariant() -> None:
     gate_names = [v.gate_name for v in pipeline.validators]
     assert gate_names == ["GATE_1_SYNTAX", "GATE_2_SECURITY"]
     assert "GATE_3_COLLECTION" not in gate_names
+
+
+# -------------------------------------------------------------------------
+# Validated Reconstruction & Status Transition Invariant Tests
+# -------------------------------------------------------------------------
+
+def test_validation_pipeline_path_quarantined_preserved() -> None:
+    """
+    Path 1: Generation QUARANTINED candidate remains QUARANTINED with reason unchanged.
+    Identity, retry count, timestamps, and fields are preserved.
+    """
+    pipeline = ValidationPipeline()
+    cand = _make_candidate(
+        code="def unrepairable_code(:",
+        status=ValidationStatus.QUARANTINED,
+        quarantine_reason="EXHAUSTED_GENERATION_REPAIRS",
+    )
+    cand_with_retries = cand.model_copy(update={"retry_count": 2})
+
+    updated_cand, result = pipeline.validate_candidate(cand_with_retries)
+
+    assert updated_cand.validation_status == ValidationStatus.QUARANTINED
+    assert updated_cand.quarantine_reason == "EXHAUSTED_GENERATION_REPAIRS"
+    assert updated_cand.candidate_id == cand_with_retries.candidate_id
+    assert updated_cand.run_id == cand_with_retries.run_id
+    assert updated_cand.retry_count == 2
+    assert updated_cand.created_at == cand_with_retries.created_at
+    assert result.status == ValidationStatus.QUARANTINED
+    assert result.passed is False
+    assert result.gate == "PRE_VALIDATION"
+
+
+def test_validation_pipeline_path_gate_1_rejected_syntax() -> None:
+    """
+    Path 2: Gate 1 failure transitions to REJECTED_SYNTAX via validated reconstruction.
+    Preserves all fields, identity, retry count, created_at, with quarantine_reason remaining None.
+    """
+    pipeline = ValidationPipeline()
+    cand = _make_candidate(
+        code="def test_broken(:\n    assert True\n",
+        status=ValidationStatus.PENDING,
+    )
+    cand_with_retries = cand.model_copy(update={"retry_count": 1})
+
+    updated_cand, result = pipeline.validate_candidate(cand_with_retries)
+
+    assert updated_cand.validation_status == ValidationStatus.REJECTED_SYNTAX
+    assert updated_cand.quarantine_reason is None
+    assert updated_cand.candidate_id == cand_with_retries.candidate_id
+    assert updated_cand.run_id == cand_with_retries.run_id
+    assert updated_cand.target_symbol_name == cand_with_retries.target_symbol_name
+    assert updated_cand.test_file_path == cand_with_retries.test_file_path
+    assert updated_cand.candidate_code == cand_with_retries.candidate_code
+    assert updated_cand.imports == cand_with_retries.imports
+    assert updated_cand.retry_count == 1
+    assert updated_cand.created_at == cand_with_retries.created_at
+    assert result.status == ValidationStatus.REJECTED_SYNTAX
+    assert result.gate == "GATE_1_SYNTAX"
+    assert result.passed is False
+
+
+def test_validation_pipeline_path_gate_2_rejected_security() -> None:
+    """
+    Path 3: Gate 2 failure transitions to REJECTED_SECURITY via validated reconstruction.
+    Preserves all fields, identity, retry count, created_at, with quarantine_reason remaining None.
+    """
+    pipeline = ValidationPipeline()
+    cand = _make_candidate(
+        code="def test_unsafe():\n    import subprocess\n    subprocess.run(['ls'])\n",
+        imports=("import subprocess",),
+        status=ValidationStatus.PENDING,
+    )
+
+    updated_cand, result = pipeline.validate_candidate(cand)
+
+    assert updated_cand.validation_status == ValidationStatus.REJECTED_SECURITY
+    assert updated_cand.quarantine_reason is None
+    assert updated_cand.candidate_id == cand.candidate_id
+    assert updated_cand.run_id == cand.run_id
+    assert updated_cand.retry_count == cand.retry_count
+    assert updated_cand.created_at == cand.created_at
+    assert result.status == ValidationStatus.REJECTED_SECURITY
+    assert result.gate == "GATE_2_SECURITY"
+    assert result.passed is False
+
+
+def test_validation_pipeline_path_static_passed() -> None:
+    """
+    Path 4: Clean candidate transitions to PASSED for static screening only via validated reconstruction.
+    Preserves all fields, identity, retry count, created_at, with quarantine_reason remaining None.
+    """
+    pipeline = ValidationPipeline()
+    cand = _make_candidate(
+        code="def test_add():\n    assert 1 + 1 == 2\n",
+        imports=("import pytest",),
+        status=ValidationStatus.PENDING,
+    )
+    cand_with_retries = cand.model_copy(update={"retry_count": 1})
+
+    updated_cand, result = pipeline.validate_candidate(cand_with_retries)
+
+    assert updated_cand.validation_status == ValidationStatus.PASSED
+    assert updated_cand.quarantine_reason is None
+    assert updated_cand.candidate_id == cand_with_retries.candidate_id
+    assert updated_cand.run_id == cand_with_retries.run_id
+    assert updated_cand.retry_count == 1
+    assert updated_cand.created_at == cand_with_retries.created_at
+    assert result.status == ValidationStatus.PASSED
+    assert result.gate == "STATIC_PIPELINE"
+    assert result.passed is True
+
+
+def test_validation_pipeline_reconstruct_candidate_rejects_invalid_enum_status() -> None:
+    """
+    Negative test: Validated reconstruction strictly rejects invalid enum statuses.
+    Ensures that validation bypass (which occurred with model_copy) is impossible.
+    """
+    cand = _make_candidate(code="def test_foo(): pass\n")
+
+    # 1. Negative test: validated reconstruction raises ValidationError on invalid status
+    with pytest.raises(ValidationError):
+        ValidationPipeline._reconstruct_candidate(cand, "INVALID_STATUS")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        ValidationPipeline._reconstruct_candidate(cand, 999)  # type: ignore[arg-type]
+
+    # 2. Positive test: validated reconstruction succeeds on all valid ValidationStatus enum values
+    for valid_status in ValidationStatus:
+        reconstructed = ValidationPipeline._reconstruct_candidate(cand, valid_status)
+        assert reconstructed.validation_status == valid_status
+        assert reconstructed.candidate_id == cand.candidate_id
+        assert reconstructed.created_at == cand.created_at
