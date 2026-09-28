@@ -5,5 +5,22 @@ Stage 3 Section 4.4.2.
 
 from agentic_test.core.protocols.analyzer import CodeAnalyzer
 from agentic_test.core.protocols.llm import LLMService
+from agentic_test.core.protocols.sandbox import (
+    ExecutionRawResult,
+    SandboxConfig,
+    SandboxError,
+    SandboxExecutionError,
+    SandboxInitializationError,
+    SandboxManager,
+)
 
-__all__ = ["CodeAnalyzer", "LLMService"]
+__all__ = [
+    "CodeAnalyzer",
+    "ExecutionRawResult",
+    "LLMService",
+    "SandboxConfig",
+    "SandboxError",
+    "SandboxExecutionError",
+    "SandboxInitializationError",
+    "SandboxManager",
+]
