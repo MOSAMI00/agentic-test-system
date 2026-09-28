@@ -1,0 +1,37 @@
+# Hardened Runner Container Definition for Isolated Test Execution
+# Stage 2 Domain 5 (FR-11, FR-12, FR-14, FR-15) and Stage 3 Section 4.4.4.5
+# Target Image: agentic-runner:0.1.0
+
+FROM python:3.11-slim-bookworm
+
+LABEL org.opencontainers.image.title="agentic-runner" \
+      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.description="Hardened unprivileged test runner container for sandboxed execution"
+
+# Environment configuration: unbuffered standard streams, bytecode caching disabled
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/workspace/src:/workspace
+
+# Install required test execution tooling
+RUN pip install --no-cache-dir \
+    "pytest>=8.0.0,<9.0.0" \
+    "pytest-cov>=4.1.0,<6.0.0"
+
+# Provision dedicated non-root user and group with fixed UID/GID 10001 (FR-12, INV-01)
+RUN groupadd -g 10001 runner && \
+    useradd -u 10001 -g 10001 -m -s /bin/sh runner
+
+# Establish workspace directory owned by the unprivileged user
+# Zero application source or candidate code is copied into this image (INV-02, INV-04)
+RUN mkdir -p /workspace && \
+    chown -R 10001:10001 /workspace
+
+# Enforce unprivileged user execution context (FR-12)
+USER 10001:10001
+WORKDIR /workspace
+
+# Default idle keepalive command for container lifecycle management
+# Overridden dynamically during command execution via SandboxManager.execute_command
+CMD ["tail", "-f", "/dev/null"]
