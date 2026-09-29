@@ -3,16 +3,34 @@ Unit tests for deterministic rule-based failure triage classifier (Engine 1).
 WBS 1.6.1A / FR-18.
 """
 
+from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from agentic_test.core.models import ExecutionEvidence, FailureCategory
+from agentic_test.core.models import (
+    ChangeType,
+    DiffHunk,
+    ExecutionEvidence,
+    FailureCategory,
+    SymbolContract,
+    SymbolType,
+    TestCandidate,
+)
+from agentic_test.diagnosis.llm_classifier import (
+    CognitiveLLMClassifier,
+    DiagnosisResponseSchema,
+)
 from agentic_test.diagnosis.rules import (
     DeterministicRuleClassifier,
     RuleClassificationResult,
 )
+from agentic_test.generation.exceptions import (
+    LLMCommunicationError,
+    SchemaValidationError,
+)
+from agentic_test.generation.mock_llm import MockLLMService
 
 
 def _make_evidence(
@@ -472,3 +490,311 @@ def test_no_subprocess_or_external_calls_during_classification() -> None:
         mock_sub_popen.assert_not_called()
         mock_os_sys.assert_not_called()
         mock_socket.assert_not_called()
+
+
+# =============================================================================
+# 9. Cognitive LLM Classifier Tests (Engine 2 / Slice 1.6.1B)
+# =============================================================================
+
+def test_cognitive_high_confidence_application_bug() -> None:
+    """Verifies high-confidence APPLICATION_BUG is returned intact."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.92,
+        explanation="Target function violates contract on negative inputs.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(
+        exit_code=1,
+        traceback="AssertionError: assert calculate(-1) == 0",
+    )
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.APPLICATION_BUG
+    assert result.confidence == 0.92
+    assert "Target function violates contract" in result.explanation
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_high_confidence_test_outdated() -> None:
+    """Verifies high-confidence TEST_OUTDATED is returned intact."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.TEST_OUTDATED,
+        confidence=0.88,
+        explanation="Symbol signature and return type updated in recent commit.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(
+        exit_code=1,
+        traceback="TypeError: calculate() takes 2 arguments but 3 were given",
+    )
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.TEST_OUTDATED
+    assert result.confidence == 0.88
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_high_confidence_invalid_generated_test() -> None:
+    """Verifies high-confidence INVALID_GENERATED_TEST is returned intact."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.INVALID_GENERATED_TEST,
+        confidence=0.85,
+        explanation="Test assertion assumes deprecated behavior not present in API.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError: assert None is not None")
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.INVALID_GENERATED_TEST
+    assert result.confidence == 0.85
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_low_confidence_normalized_to_unknown() -> None:
+    """Verifies response with confidence < 0.70 is normalized to UNKNOWN."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.65,
+        explanation="Ambiguous failure, could be application regression or flaky test.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.UNKNOWN
+    assert result.confidence == 0.65
+    assert "Low confidence (0.65 < 0.70)" in result.explanation
+    assert mock_llm.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "reserved_cat",
+    [
+        FailureCategory.ENVIRONMENT_FAILURE,
+        FailureCategory.CONFIGURATION_ERROR,
+    ],
+)
+def test_cognitive_normalizes_reserved_deterministic_categories_to_unknown(
+    reserved_cat: FailureCategory,
+) -> None:
+    """
+    Verifies that if the LLM emits a deterministic-owned category,
+    it is normalized to UNKNOWN because deterministic rules own those categories.
+    """
+    canned = DiagnosisResponseSchema(
+        category=reserved_cat,
+        confidence=0.95,
+        explanation="Environment or config issue detected by model.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, stderr="Something went wrong")
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.UNKNOWN
+    assert result.confidence == 0.95
+    assert "reserved for deterministic rules" in result.explanation
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_schema_validation_error_handled_as_llm_failure() -> None:
+    """Verifies that schema validation failures in the LLM service return LLM_FAILURE."""
+    mock_llm = MockLLMService()
+    mock_llm.enqueue_error(SchemaValidationError("Missing required field 'explanation'"))
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.LLM_FAILURE
+    assert result.confidence == 0.0
+    assert "schema validation failed" in result.explanation.lower()
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_communication_error_handled_as_llm_failure() -> None:
+    """Verifies that network/gateway communication errors return LLM_FAILURE without crashing."""
+    mock_llm = MockLLMService()
+    mock_llm.enqueue_error(LLMCommunicationError("503 Service Unavailable: upstream rate limit"))
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.LLM_FAILURE
+    assert result.confidence == 0.0
+    assert "communication failed" in result.explanation.lower()
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_timeout_error_handled_as_llm_failure() -> None:
+    """Verifies that API timeouts return LLM_FAILURE without crashing."""
+    mock_llm = MockLLMService()
+    mock_llm.enqueue_error(TimeoutError("Request timed out after 30 seconds"))
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.LLM_FAILURE
+    assert result.confidence == 0.0
+    assert "communication failed" in result.explanation.lower()
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_unexpected_exception_handled_as_unknown() -> None:
+    """Verifies that generic unhandled exceptions return UNKNOWN without crashing."""
+    mock_llm = MockLLMService()
+    mock_llm.enqueue_error(RuntimeError("Unexpected thread termination"))
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    result = classifier.classify(evidence)
+
+    assert result.category == FailureCategory.UNKNOWN
+    assert result.confidence == 0.0
+    assert "unexpected error" in result.explanation.lower()
+    assert mock_llm.call_count == 1
+
+
+def test_cognitive_deterministic_prompt_contents_and_parameters() -> None:
+    """Verifies that prompt context is assembled deterministically with temperature=0.0."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.90,
+        explanation="Regression in target logic.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+
+    evidence = _make_evidence(
+        exit_code=1,
+        traceback="AssertionError: assert 1 == 2",
+        stderr="Traceback (most recent call last): ...",
+        stdout="collected 1 item\n1 failed",
+        duration_sec=2.5,
+    )
+    candidate = TestCandidate(
+        candidate_id="cand-1",
+        run_id="run-1",
+        target_symbol_name="calculate",
+        test_file_path=Path("tests/test_calc.py"),
+        candidate_code="def test_calc(): assert calculate() == 2",
+    )
+    target_symbol = SymbolContract(
+        qualified_name="calculator.calculate",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calculator.py"),
+        line_range=(10, 20),
+        signature="def calculate(x: int) -> int",
+        docstring="Computes the calculation.",
+    )
+    diff = DiffHunk(
+        file_path=Path("src/calculator.py"),
+        old_start=12,
+        old_lines=3,
+        new_start=12,
+        new_lines=4,
+        change_type=ChangeType.MODIFIED,
+        content="@@ -12,3 +12,4 @@\n- return x + 1\n+ return x + 2",
+    )
+
+    result = classifier.classify(
+        evidence=evidence,
+        candidate=candidate,
+        target_symbol=target_symbol,
+        diff_hunk=diff,
+    )
+
+    assert result.category == FailureCategory.APPLICATION_BUG
+    assert mock_llm.call_count == 1
+
+    call = mock_llm.calls[0]
+    assert call["temperature"] == 0.0
+    assert call["response_schema"] == DiagnosisResponseSchema
+    prompt = call["prompt"]
+
+    # Verify structured elements in prompt
+    assert "Exit Code: 1" in prompt
+    assert "Duration: 2.50s" in prompt
+    assert "AssertionError: assert 1 == 2" in prompt
+    assert "def test_calc(): assert calculate() == 2" in prompt
+    assert "calculator.calculate" in prompt
+    assert "def calculate(x: int) -> int" in prompt
+    assert "Computes the calculation." in prompt
+    assert "@@ -12,3 +12,4 @@" in prompt
+
+
+def test_cognitive_no_file_io_or_code_execution() -> None:
+    """Verifies that CognitiveLLMClassifier performs zero file I/O, subprocess, or network calls."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.88,
+        explanation="Valid bug diagnosis",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+
+    with patch("builtins.open") as mock_open, \
+         patch("subprocess.run") as mock_sub_run, \
+         patch("socket.socket") as mock_socket:
+
+        result = classifier.classify(evidence)
+
+        assert result.category == FailureCategory.APPLICATION_BUG
+        mock_open.assert_not_called()
+        mock_sub_run.assert_not_called()
+        mock_socket.assert_not_called()
+
+
+def test_diagnosis_response_schema_validation_and_immutability() -> None:
+    """Verifies that DiagnosisResponseSchema validates inputs and enforces immutability."""
+    # Valid model
+    valid_schema = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.85,
+        explanation="Valid explanation",
+    )
+    assert valid_schema.confidence == 0.85
+
+    # Out of range confidence (> 1.0)
+    with pytest.raises(ValidationError):
+        DiagnosisResponseSchema(
+            category=FailureCategory.APPLICATION_BUG,
+            confidence=1.1,
+            explanation="Invalid confidence",
+        )
+
+    # Out of range confidence (< 0.0)
+    with pytest.raises(ValidationError):
+        DiagnosisResponseSchema(
+            category=FailureCategory.APPLICATION_BUG,
+            confidence=-0.1,
+            explanation="Invalid confidence",
+        )
+
+    # Empty explanation
+    with pytest.raises(ValidationError):
+        DiagnosisResponseSchema(
+            category=FailureCategory.APPLICATION_BUG,
+            confidence=0.8,
+            explanation="",
+        )
+
+    # Immutability
+    with pytest.raises(ValidationError):
+        setattr(valid_schema, "confidence", 0.5)
+
+    with pytest.raises(ValidationError):
+        setattr(valid_schema, "category", FailureCategory.UNKNOWN)
