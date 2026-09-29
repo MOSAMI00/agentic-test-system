@@ -169,14 +169,16 @@ class ExecutionEvidence(BaseModel):
 
     evidence_id: str
     run_id: str
-    candidate_id: str
+    candidate_id: Optional[str] = None
     exit_code: int
     stdout: str
     stderr: str
     duration_sec: float
     timed_out: bool = False
-    line_coverage: float = 0.0
-    branch_coverage: float = 0.0
+    line_coverage: Optional[float] = None
+    branch_coverage: Optional[float] = None
+    line_coverage_delta: Optional[float] = None
+    branch_coverage_delta: Optional[float] = None
     traceback: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

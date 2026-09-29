@@ -5,6 +5,7 @@ Verifies validation, immutability (NFR-06), serialization, and Option A defaults
 
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict
 import pytest
 from pydantic import ValidationError
 
@@ -234,7 +235,7 @@ def test_workflow_state_rejects_invalid_field_types() -> None:
         WorkflowState(
             run_id="run-01",
             repo_path=Path("/tmp/repo"),
-            evidence="invalid_evidence",  # type: ignore[arg-type]
+            evidences=("invalid_evidence",),  # type: ignore[arg-type]
         )
 
     # 4. Reject invalid diagnoses list item (expects FailureDiagnosis, reject str or int)
@@ -294,7 +295,7 @@ def test_workflow_state_with_valid_stage3_entities() -> None:
         repo_path=Path("/tmp/repo"),
         plan=plan,
         candidates=(candidate,),
-        evidence=evidence,
+        evidences=(evidence,),
         diagnoses=(diagnosis,),
     )
 
@@ -598,4 +599,269 @@ def test_workflow_state_validated_reconstruction() -> None:
     assert initial_state.candidates == ()
 
 
+# =========================================================================
+# Pre-Iteration-1.6 Slice 1: Evidence & WorkflowState Data Model Tests
+# =========================================================================
 
+def test_execution_evidence_nullable_fields_and_deltas() -> None:
+    """
+    ExecutionEvidence supports nullable candidate_id, nullable line/branch coverage,
+    and nullable coverage deltas, while enforcing immutability.
+    """
+    # 1. Default instantiation with None for optional fields
+    evidence = ExecutionEvidence(
+        evidence_id="ev-min-001",
+        run_id="run-min-001",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.5,
+    )
+    assert evidence.candidate_id is None
+    assert evidence.line_coverage is None
+    assert evidence.branch_coverage is None
+    assert evidence.line_coverage_delta is None
+    assert evidence.branch_coverage_delta is None
+    assert evidence.timed_out is False
+    assert evidence.traceback is None
+
+    # 2. Populated instantiation
+    populated = ExecutionEvidence(
+        evidence_id="ev-pop-001",
+        run_id="run-pop-001",
+        candidate_id="cand-42",
+        exit_code=0,
+        stdout="passed",
+        stderr="",
+        duration_sec=1.2,
+        timed_out=False,
+        line_coverage=85.5,
+        branch_coverage=75.0,
+        line_coverage_delta=5.5,
+        branch_coverage_delta=2.0,
+        traceback=None,
+    )
+    assert populated.candidate_id == "cand-42"
+    assert populated.line_coverage == 85.5
+    assert populated.branch_coverage == 75.0
+    assert populated.line_coverage_delta == 5.5
+    assert populated.branch_coverage_delta == 2.0
+
+    # 3. Immutability enforcement (frozen=True)
+    with pytest.raises(ValidationError):
+        setattr(populated, "line_coverage", 90.0)
+
+    with pytest.raises(ValidationError):
+        setattr(populated, "candidate_id", "cand-99")
+
+
+def test_workflow_state_evidences_tuple_and_immutability() -> None:
+    """
+    WorkflowState stores canonical evidences as an immutable Tuple[ExecutionEvidence, ...]
+    and defaults to empty tuple.
+    """
+    state = WorkflowState(
+        run_id="run-ev-01",
+        repo_path=Path("/tmp/repo"),
+    )
+    assert state.evidences == ()
+    assert state.baseline_evidence is None
+    assert state.evidence is None
+
+    # Frozen state mutation rejection
+    with pytest.raises(ValidationError):
+        setattr(state, "evidences", ())
+
+    with pytest.raises(ValidationError):
+        setattr(state, "baseline_evidence", None)
+
+
+def test_workflow_state_baseline_evidence_with_null_candidate_id() -> None:
+    """
+    WorkflowState supports separate baseline_evidence with candidate_id=None
+    for regression suite baseline runs.
+    """
+    baseline_ev = ExecutionEvidence(
+        evidence_id="ev-base-001",
+        run_id="run-base-01",
+        candidate_id=None,
+        exit_code=0,
+        stdout="10 passed",
+        stderr="",
+        duration_sec=3.5,
+        line_coverage=70.0,
+        branch_coverage=60.0,
+    )
+
+    state = WorkflowState(
+        run_id="run-base-01",
+        repo_path=Path("/tmp/repo"),
+        baseline_evidence=baseline_ev,
+    )
+    assert state.baseline_evidence == baseline_ev
+    assert state.baseline_evidence.candidate_id is None
+    assert state.evidences == ()
+    assert state.evidence is None
+
+
+def test_workflow_state_legacy_singular_evidence_migration() -> None:
+    """
+    WorkflowState model_validator migrates legacy singular 'evidence'
+    to canonical 'evidences' tuple.
+    """
+    ev = ExecutionEvidence(
+        evidence_id="ev-leg-001",
+        run_id="run-leg-01",
+        candidate_id="cand-leg-01",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.2,
+    )
+
+    # 1. Constructor passing legacy evidence dictionary unpacking
+    legacy_kwargs: Dict[str, Any] = {
+        "run_id": "run-leg-01",
+        "repo_path": Path("/tmp/repo"),
+        "evidence": ev,
+    }
+    state = WorkflowState(**legacy_kwargs)
+    assert state.evidences == (ev,)
+    assert state.evidence == ev
+    assert isinstance(state.evidences, tuple)
+
+    # 2. Dictionary / model_validate passing legacy "evidence"
+    state_from_dict = WorkflowState.model_validate({
+        "run_id": "run-leg-01",
+        "repo_path": Path("/tmp/repo"),
+        "evidence": ev.model_dump(),
+    })
+    assert len(state_from_dict.evidences) == 1
+    assert state_from_dict.evidences[0].evidence_id == "ev-leg-001"
+    assert state_from_dict.evidence is not None
+    assert state_from_dict.evidence.evidence_id == "ev-leg-001"
+
+
+def test_workflow_state_legacy_evidence_none_migration() -> None:
+    """
+    Legacy evidence=None migrates cleanly to empty evidences tuple.
+    """
+    kwargs: Dict[str, Any] = {
+        "run_id": "run-none-01",
+        "repo_path": Path("/tmp/repo"),
+        "evidence": None,
+    }
+    state = WorkflowState(**kwargs)
+    assert state.evidences == ()
+    assert state.evidence is None
+
+
+def test_workflow_state_legacy_evidence_list_tuple_migration() -> None:
+    """
+    Legacy evidence passed as list or tuple migrates to evidences tuple.
+    """
+    ev1 = ExecutionEvidence(
+        evidence_id="ev-1", run_id="r1", exit_code=0, stdout="", stderr="", duration_sec=0.1
+    )
+    ev2 = ExecutionEvidence(
+        evidence_id="ev-2", run_id="r1", exit_code=1, stdout="", stderr="", duration_sec=0.2
+    )
+
+    kwargs: Dict[str, Any] = {
+        "run_id": "r1",
+        "repo_path": Path("/tmp/repo"),
+        "evidence": [ev1, ev2],
+    }
+    state = WorkflowState(**kwargs)
+    assert state.evidences == (ev1, ev2)
+    assert state.evidence == ev1
+
+
+def test_workflow_state_rejects_conflicting_evidence_and_evidences() -> None:
+    """
+    WorkflowState model_validator rejects ambiguous inputs when both non-empty
+    legacy 'evidence' and canonical 'evidences' are supplied.
+    """
+    ev1 = ExecutionEvidence(
+        evidence_id="ev-1", run_id="r1", exit_code=0, stdout="", stderr="", duration_sec=0.1
+    )
+    ev2 = ExecutionEvidence(
+        evidence_id="ev-2", run_id="r1", exit_code=0, stdout="", stderr="", duration_sec=0.2
+    )
+
+    conflicting_kwargs: Dict[str, Any] = {
+        "run_id": "r1",
+        "repo_path": Path("/tmp/repo"),
+        "evidence": ev1,
+        "evidences": (ev2,),
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        WorkflowState(**conflicting_kwargs)
+    assert "Cannot specify both legacy 'evidence' and canonical 'evidences'" in str(exc_info.value)
+
+    # Non-conflicting: evidence=None with canonical evidences is accepted
+    valid_kwargs: Dict[str, Any] = {
+        "run_id": "r1",
+        "repo_path": Path("/tmp/repo"),
+        "evidence": None,
+        "evidences": (ev2,),
+    }
+    valid_state = WorkflowState(**valid_kwargs)
+    assert valid_state.evidences == (ev2,)
+
+
+def test_workflow_state_canonical_serialization_and_json_roundtrip() -> None:
+    """
+    WorkflowState serialization emits canonical 'evidences' (and not legacy 'evidence'),
+    and round-trips cleanly through JSON.
+    """
+    baseline_ev = ExecutionEvidence(
+        evidence_id="ev-base-001",
+        run_id="r1",
+        candidate_id=None,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=1.0,
+        line_coverage=75.0,
+    )
+    cand_ev = ExecutionEvidence(
+        evidence_id="ev-cand-001",
+        run_id="r1",
+        candidate_id="cand-001",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.5,
+        line_coverage=80.0,
+        line_coverage_delta=5.0,
+    )
+
+    state = WorkflowState(
+        run_id="r1",
+        repo_path=Path("/tmp/repo"),
+        baseline_evidence=baseline_ev,
+        evidences=(cand_ev,),
+    )
+
+    # 1. model_dump verification
+    dump = state.model_dump()
+    assert "evidences" in dump
+    assert "baseline_evidence" in dump
+    assert "evidence" not in dump
+    assert len(dump["evidences"]) == 1
+    assert dump["evidences"][0]["evidence_id"] == "ev-cand-001"
+    assert dump["evidences"][0]["line_coverage_delta"] == 5.0
+
+    # 2. JSON round-trip
+    state_json = state.model_dump_json()
+    assert '"evidences"' in state_json
+    assert '"evidence":' not in state_json  # Ensure legacy singular key is absent from output
+
+    restored = WorkflowState.model_validate_json(state_json)
+    assert restored == state
+    assert restored.baseline_evidence == baseline_ev
+    assert restored.baseline_evidence.candidate_id is None
+    assert restored.evidences == (cand_ev,)
+    assert restored.evidence == cand_ev
+    assert restored.evidence.line_coverage_delta == 5.0
