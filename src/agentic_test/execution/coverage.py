@@ -44,8 +44,8 @@ class CoverageMetrics(BaseModel):
     """
     model_config = ConfigDict(frozen=True)
 
-    line_coverage: float = 0.0
-    branch_coverage: float = 0.0
+    line_coverage: Optional[float] = None
+    branch_coverage: Optional[float] = None
     covered_lines: int = 0
     num_statements: int = 0
     missing_lines: int = 0
@@ -233,17 +233,20 @@ class CoverageExtractor:
 
     def calculate_deltas(
         self,
-        pre_cov: float,
-        post_cov: float,
-    ) -> float:
+        pre_cov: Optional[float],
+        post_cov: Optional[float],
+    ) -> Optional[float]:
         """
         Calculates the coverage delta between pre-execution and post-execution coverage.
 
-        :param pre_cov: Baseline coverage percentage [0.0, 100.0].
-        :param post_cov: Subsequent coverage percentage [0.0, 100.0].
-        :return: Float delta rounded to 4 decimal places (post_cov - pre_cov).
-        :raises ValueError: If coverage values are NaN or outside the valid [0.0, 100.0] range.
+        :param pre_cov: Baseline coverage percentage [0.0, 100.0] or None.
+        :param post_cov: Subsequent coverage percentage [0.0, 100.0] or None.
+        :return: Float delta rounded to 4 decimal places (post_cov - pre_cov) or None if either input is None.
+        :raises ValueError: If coverage values are non-null but NaN or outside the valid [0.0, 100.0] range.
         """
+        if pre_cov is None or post_cov is None:
+            return None
+
         if math.isnan(pre_cov) or math.isnan(post_cov):
             raise ValueError(f"Coverage percentages cannot be NaN: pre={pre_cov}, post={post_cov}")
 

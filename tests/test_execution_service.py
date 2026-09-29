@@ -231,6 +231,7 @@ def test_successful_candidate_execution(tmp_path: Path) -> None:
         "pytest",
         "/workspace/tests",
         "--cov=/workspace/src",
+        "--cov-branch",
         "--cov-report=json:/workspace/output/coverage.json",
         "-o",
         "cache_dir=/tmp/.pytest_cache",
@@ -478,8 +479,8 @@ def test_missing_coverage_json_handled_safely(source_dir: Path) -> None:
 
     evidence = service.execute(plan, [candidate])
 
-    assert evidence.line_coverage == 0.0
-    assert evidence.branch_coverage == 0.0
+    assert evidence.line_coverage is None
+    assert evidence.branch_coverage is None
     assert service.last_coverage is not None
     assert service.last_coverage.is_valid is False
     assert "not found" in (service.last_coverage.error_message or "").lower()
@@ -498,7 +499,8 @@ def test_malformed_coverage_json_handled_safely(source_dir: Path) -> None:
 
     evidence = service.execute(plan, [candidate])
 
-    assert evidence.line_coverage == 0.0
+    assert evidence.line_coverage is None
+    assert evidence.branch_coverage is None
     assert service.last_coverage is not None
     assert service.last_coverage.is_valid is False
     assert "malformed" in (service.last_coverage.error_message or "").lower()
@@ -626,7 +628,7 @@ def test_existing_tests_execution_without_candidates(source_dir: Path) -> None:
     evidence = service.execute(plan, candidates=())
 
     assert evidence.exit_code == 0
-    assert evidence.candidate_id == "existing_tests"
+    assert evidence.candidate_id is None
     assert evidence.run_id == "plan-regression-01"
 
     assert sandbox.call_count == 1
@@ -872,3 +874,556 @@ def test_clean_source_with_execute_failure_reraises_original_exception(source_di
         service.execute(plan, [candidate])
 
     assert exc_info.value is exec_err
+
+
+# =====================================================================
+# 8. Slice 4: Baseline, Per-Candidate Isolation, Multi-Path & Deltas
+# =====================================================================
+
+def test_execute_regression_baseline_produces_none_candidate_id(source_dir: Path) -> None:
+    """Verifies that execute_regression_baseline runs existing tests with candidate_id=None."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success(stdout="=== 5 passed in 0.5s ===\n")
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(
+        plan_id="plan-baseline-01",
+        existing_tests=(Path("tests/test_math.py"),),
+    )
+
+    evidence = service.execute_regression_baseline(plan)
+
+    assert evidence.candidate_id is None
+    assert evidence.exit_code == 0
+    assert evidence.line_coverage == 80.0
+    assert evidence.branch_coverage == 75.0
+    assert evidence.line_coverage_delta is None
+    assert evidence.branch_coverage_delta is None
+    assert sandbox.call_count == 1
+    cmd = sandbox.calls[0]["command"]
+    assert "/workspace/src/tests/test_math.py" in cmd
+    assert "/workspace/tests" not in cmd
+    assert "--cov-branch" in cmd
+
+
+def test_execute_regression_baseline_empty_tests_raises_value_error(source_dir: Path) -> None:
+    """Verifies that execute_regression_baseline rejects plans without existing tests."""
+    sandbox = SimulatedContainerSandboxManager()
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=())
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        service.execute_regression_baseline(plan)
+
+
+def test_three_candidates_isolated_sessions_and_distinct_ids(source_dir: Path) -> None:
+    """
+    Verifies that execute_candidates runs three candidates in three separate
+    container sessions, each with its own candidate_id and lifecycle cleanup.
+    """
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    for _ in range(3):
+        sandbox.script_success(stdout="=== 1 passed in 0.1s ===\n")
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    c1 = _make_candidate(candidate_id="cand-001")
+    c2 = _make_candidate(candidate_id="cand-002")
+    c3 = _make_candidate(candidate_id="cand-003")
+
+    evidences = service.execute_candidates(plan, [c1, c2, c3])
+
+    assert len(evidences) == 3
+    assert evidences[0].candidate_id == "cand-001"
+    assert evidences[1].candidate_id == "cand-002"
+    assert evidences[2].candidate_id == "cand-003"
+
+    # Distinct candidate IDs
+    assert len({e.candidate_id for e in evidences}) == 3
+
+    # Exactly 3 container sessions executed and terminated
+    assert sandbox.call_count == 3
+    assert len(sandbox.terminated_containers) == 3
+    assert len(set(sandbox.terminated_containers)) == 3
+    assert sandbox.active_containers == []
+
+
+def test_candidates_execute_in_deterministic_input_order(source_dir: Path) -> None:
+    """Verifies that candidates are executed in exact deterministic input order."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    for _ in range(3):
+        sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    c_z = _make_candidate(candidate_id="cand-z")
+    c_a = _make_candidate(candidate_id="cand-a")
+    c_m = _make_candidate(candidate_id="cand-m")
+
+    evidences = service.execute_candidates(plan, [c_z, c_a, c_m])
+    assert [e.candidate_id for e in evidences] == ["cand-z", "cand-a", "cand-m"]
+
+
+def test_candidate_validation_rejection_fail_fast(source_dir: Path) -> None:
+    """Verifies that execute_candidates rejects any non-PASSED candidate fail-fast before execution."""
+    sandbox = SimulatedContainerSandboxManager()
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+
+    c_passed = _make_candidate(candidate_id="cand-ok", status=ValidationStatus.PASSED)
+    c_pending = _make_candidate(candidate_id="cand-pending", status=ValidationStatus.PENDING)
+
+    with pytest.raises(StagingValidationError, match="Only candidates with validation_status == PASSED"):
+        service.execute_candidates(plan, [c_passed, c_pending])
+
+    assert sandbox.call_count == 0
+    assert sandbox.active_containers == []
+
+
+def test_batch_execution_in_single_execute_call_rejected(source_dir: Path) -> None:
+    """Verifies that execute() rejects batching multiple candidates into one session."""
+    sandbox = SimulatedContainerSandboxManager()
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    c1 = _make_candidate(candidate_id="cand-001")
+    c2 = _make_candidate(candidate_id="cand-002")
+
+    with pytest.raises(ValueError, match="Batch execution of multiple candidates.*is prohibited"):
+        service.execute(plan, [c1, c2])
+
+
+def test_all_planned_regression_paths_appear_in_each_command(source_dir: Path) -> None:
+    """Verifies that multi-path regression preserves all planned paths in baseline and candidate commands."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    # Baseline + candidate
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(
+        existing_tests=(
+            Path("tests/test_math.py"),
+            Path("tests/test_calc.py"),
+        ),
+    )
+    candidate = _make_candidate(candidate_id="cand-001")
+
+    # 1. Baseline
+    service.execute_regression_baseline(plan)
+    baseline_cmd = sandbox.calls[0]["command"]
+    assert "/workspace/src/tests/test_math.py" in baseline_cmd
+    assert "/workspace/src/tests/test_calc.py" in baseline_cmd
+    assert "/workspace/tests" not in baseline_cmd
+
+    # 2. Candidate
+    service.execute_candidate(plan, candidate)
+    cand_cmd = sandbox.calls[1]["command"]
+    assert "/workspace/tests" in cand_cmd
+    assert "/workspace/src/tests/test_math.py" in cand_cmd
+    assert "/workspace/src/tests/test_calc.py" in cand_cmd
+    # Verify order preservation
+    idx_tests = cand_cmd.index("/workspace/tests")
+    idx_math = cand_cmd.index("/workspace/src/tests/test_math.py")
+    idx_calc = cand_cmd.index("/workspace/src/tests/test_calc.py")
+    assert idx_tests < idx_math < idx_calc
+
+
+def test_candidate_session_is_separate_from_baseline_session(source_dir: Path) -> None:
+    """Verifies that baseline and candidate runs execute in completely separate container sessions."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    base_ev = service.execute_regression_baseline(plan)
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+
+    assert sandbox.call_count == 2
+    assert len(sandbox.terminated_containers) == 2
+    assert sandbox.terminated_containers[0] != sandbox.terminated_containers[1]
+    assert base_ev.evidence_id != cand_ev.evidence_id
+    assert base_ev.candidate_id is None
+    assert cand_ev.candidate_id == candidate.candidate_id
+
+
+def test_valid_line_and_branch_coverage_deltas(source_dir: Path) -> None:
+    """
+    Verifies that when baseline and candidate runs complete with exit_code=0
+    and matching settings, line and branch coverage deltas are correctly computed.
+    """
+    baseline_cov_json = json.dumps({
+        "totals": {
+            "covered_lines": 60,
+            "num_statements": 100,
+            "percent_covered": 60.0,
+            "num_branches": 20,
+            "covered_branches": 10,
+        }
+    })
+    candidate_cov_json = json.dumps({
+        "totals": {
+            "covered_lines": 75,
+            "num_statements": 100,
+            "percent_covered": 75.5,
+            "num_branches": 20,
+            "covered_branches": 13,
+        }
+    })
+
+    sandbox = SimulatedContainerSandboxManager()
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    # Set baseline coverage payload
+    sandbox.coverage_payload = baseline_cov_json
+    base_ev = service.execute_regression_baseline(plan)
+    assert base_ev.line_coverage == 60.0
+    assert base_ev.branch_coverage == 50.0
+
+    # Set candidate coverage payload (13/20 = 65.0%)
+    sandbox.coverage_payload = candidate_cov_json
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+
+    assert cand_ev.line_coverage == 75.5
+    assert cand_ev.branch_coverage == 65.0
+    assert cand_ev.line_coverage_delta == 15.5
+    assert cand_ev.branch_coverage_delta == 15.0
+
+
+def test_none_deltas_on_failed_baseline(source_dir: Path) -> None:
+    """Verifies that line/branch coverage deltas are None when baseline run failed (exit_code != 0)."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    # Baseline failure
+    sandbox.script_failure(exit_code=1, stdout="=== 1 failed in 0.1s ===\n")
+    # Candidate success
+    sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    base_ev = service.execute_regression_baseline(plan)
+    assert base_ev.exit_code == 1
+
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+    assert cand_ev.exit_code == 0
+    assert cand_ev.line_coverage_delta is None
+    assert cand_ev.branch_coverage_delta is None
+
+
+def test_none_deltas_on_failed_candidate(source_dir: Path) -> None:
+    """Verifies that line/branch coverage deltas are None when candidate run failed (exit_code != 0)."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    # Baseline success
+    sandbox.script_success()
+    # Candidate failure
+    sandbox.script_failure(exit_code=1, stdout="=== 1 failed in 0.1s ===\n")
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    base_ev = service.execute_regression_baseline(plan)
+    assert base_ev.exit_code == 0
+
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+    assert cand_ev.exit_code == 1
+    assert cand_ev.line_coverage_delta is None
+    assert cand_ev.branch_coverage_delta is None
+
+
+def test_none_deltas_on_invalid_or_missing_coverage(source_dir: Path) -> None:
+    """Verifies that line/branch coverage deltas are None when coverage report is missing or malformed."""
+    sandbox = SimulatedContainerSandboxManager()
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    # Valid baseline
+    sandbox.coverage_payload = VALID_COVERAGE_JSON
+    base_ev = service.execute_regression_baseline(plan)
+
+    # Missing coverage on candidate
+    sandbox.coverage_payload = None
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+    assert cand_ev.line_coverage is None
+    assert cand_ev.branch_coverage is None
+    assert cand_ev.line_coverage_delta is None
+    assert cand_ev.branch_coverage_delta is None
+
+
+def test_none_deltas_on_mismatched_settings(source_dir: Path) -> None:
+    """
+    Verifies that when baseline and candidate use mismatched coverage settings
+    (e.g., cov_branch=True vs cov_branch=False or different cov_source),
+    deltas are None (do not infer comparability merely from numeric values).
+    """
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success()
+    sandbox.script_success()
+
+    # Service 1: cov_branch=True
+    service1 = ExecutionService(
+        sandbox_manager=sandbox,
+        source_root=source_dir,
+        cov_source="/workspace/src",
+        cov_branch=True,
+    )
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    base_ev = service1.execute_regression_baseline(plan)
+    assert base_ev.line_coverage == 80.0
+
+    # Service 2: cov_branch=False (mismatched branch setting!)
+    service2 = ExecutionService(
+        sandbox_manager=sandbox,
+        source_root=source_dir,
+        cov_source="/workspace/src",
+        cov_branch=False,
+    )
+    candidate = _make_candidate()
+    cand_ev = service2.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+
+    assert cand_ev.line_coverage == 80.0
+    assert cand_ev.line_coverage_delta is None
+    assert cand_ev.branch_coverage_delta is None
+
+
+def test_cleanup_on_every_candidate_and_baseline_session(tmp_path: Path, source_dir: Path) -> None:
+    """Verifies that ephemeral staging and scratch mounts are cleaned up on each session."""
+    staging_root = tmp_path / "staging_parent"
+    staging_root.mkdir()
+    scratch_root = tmp_path / "scratch_parent"
+    scratch_root.mkdir()
+
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    for _ in range(3):
+        sandbox.script_success()
+
+    service = ExecutionService(
+        sandbox_manager=sandbox,
+        source_root=source_dir,
+        staging_root=staging_root,
+        scratch_root=scratch_root,
+    )
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    c1 = _make_candidate(candidate_id="c1")
+    c2 = _make_candidate(candidate_id="c2")
+
+    base_ev = service.execute_regression_baseline(plan)
+    assert list(staging_root.iterdir()) == []
+    assert list(scratch_root.iterdir()) == []
+
+    evs = service.execute_candidates(plan, [c1, c2], baseline_evidence=base_ev)
+    assert len(evs) == 2
+    assert list(staging_root.iterdir()) == []
+    assert list(scratch_root.iterdir()) == []
+    assert sandbox.active_containers == []
+
+
+def test_source_integrity_intact_across_candidate_and_baseline(source_dir: Path) -> None:
+    """Verifies that INV-02 source integrity verification guards both baseline and candidate runs."""
+    target_file = source_dir / "sample.py"
+
+    # Baseline tampering
+    sandbox_base = SimulatedContainerSandboxManager(tamper_target=target_file)
+    service_base = ExecutionService(sandbox_manager=sandbox_base, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+
+    with pytest.raises(SourceIntegrityError):
+        service_base.execute_regression_baseline(plan)
+
+    # Restore file
+    target_file.write_text("def hello(): return 'world'\n", encoding="utf-8")
+
+    # Candidate tampering
+    sandbox_cand = SimulatedContainerSandboxManager(tamper_target=target_file)
+    service_cand = ExecutionService(sandbox_manager=sandbox_cand, source_root=source_dir)
+    candidate = _make_candidate()
+
+    with pytest.raises(SourceIntegrityError):
+        service_cand.execute_candidate(plan, candidate)
+
+
+def test_settings_do_not_leak_between_execution_service_instances(source_dir: Path) -> None:
+    """Verifies that evidence settings are instance-scoped and never leak between ExecutionService instances."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success()
+
+    service1 = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    service2 = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    base_ev = service1.execute_regression_baseline(plan)
+
+    # Registered on service1
+    assert service1.get_evidence_settings(base_ev.evidence_id) is not None
+    # Completely absent on service2
+    assert service2.get_evidence_settings(base_ev.evidence_id) is None
+
+
+def test_one_run_cleanup_cannot_erase_another_run_settings(source_dir: Path) -> None:
+    """
+    Verifies that releasing settings or finishing execution in one ExecutionService instance
+    cannot erase settings belonging to another concurrent/independent run.
+    """
+    sandbox_a = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox_a.script_success()
+    sandbox_a.script_success()
+
+    sandbox_b = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox_b.script_success()
+    sandbox_b.script_success()
+
+    service_a = ExecutionService(sandbox_manager=sandbox_a, source_root=source_dir)
+    service_b = ExecutionService(sandbox_manager=sandbox_b, source_root=source_dir)
+
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    cand_a = _make_candidate(candidate_id="cand-a")
+    cand_b = _make_candidate(candidate_id="cand-b")
+
+    # Baseline for run A and run B
+    base_a = service_a.execute_regression_baseline(plan)
+    base_b = service_b.execute_regression_baseline(plan)
+
+    assert service_a.get_evidence_settings(base_a.evidence_id) is not None
+    assert service_b.get_evidence_settings(base_b.evidence_id) is not None
+
+    # Run A finishes candidate execution, releasing base_a settings
+    service_a.execute_candidate(plan, cand_a, baseline_evidence=base_a)
+    assert service_a.get_evidence_settings(base_a.evidence_id) is None
+
+    # Run B's settings are completely untouched and still intact!
+    assert service_b.get_evidence_settings(base_b.evidence_id) is not None
+
+    # Run B can successfully compute deltas against its baseline
+    cand_ev_b = service_b.execute_candidate(plan, cand_b, baseline_evidence=base_b)
+    assert cand_ev_b.line_coverage_delta == 0.0
+    assert cand_ev_b.branch_coverage_delta == 0.0
+
+
+def test_same_instance_baseline_and_candidate_computes_deltas(source_dir: Path) -> None:
+    """Verifies that baseline and candidate executions on the same instance compute coverage deltas."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    base_ev = service.execute_regression_baseline(plan)
+    assert base_ev.line_coverage == 80.0
+
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+    assert cand_ev.line_coverage == 80.0
+    assert cand_ev.line_coverage_delta == 0.0
+    assert cand_ev.branch_coverage_delta == 0.0
+
+
+def test_unavailable_settings_produce_none_deltas(source_dir: Path) -> None:
+    """Verifies that when baseline settings are unavailable (cross-service or unrecorded), deltas are None."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service1 = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    service2 = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    base_ev = service1.execute_regression_baseline(plan)
+
+    # Executed on service2 where base_ev settings are not registered
+    cand_ev = service2.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+    assert cand_ev.line_coverage == 80.0
+    assert cand_ev.line_coverage_delta is None
+    assert cand_ev.branch_coverage_delta is None
+
+
+def test_settings_are_released_after_candidate_delta_computation(source_dir: Path) -> None:
+    """
+    Verifies that settings are deterministically released after candidate delta computation
+    so no memory leak or unbounded settings retention occurs.
+    """
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    base_ev = service.execute_regression_baseline(plan)
+    assert service.get_evidence_settings(base_ev.evidence_id) is not None
+
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+    assert cand_ev.line_coverage_delta == 0.0
+
+    # Baseline settings released after candidate delta computation
+    assert service.get_evidence_settings(base_ev.evidence_id) is None
+    # Candidate itself was not registered as a baseline
+    assert service.get_evidence_settings(cand_ev.evidence_id) is None
+
+
+def test_same_instance_mismatched_settings_produce_none_deltas(source_dir: Path) -> None:
+    """Verifies that when baseline settings on the same instance differ in cov_branch, deltas are None."""
+    sandbox = SimulatedContainerSandboxManager(coverage_payload=VALID_COVERAGE_JSON)
+    sandbox.script_success()
+    sandbox.script_success()
+
+    service = ExecutionService(
+        sandbox_manager=sandbox,
+        source_root=source_dir,
+        cov_source="/workspace/src",
+        cov_branch=True,
+    )
+    plan = _make_plan(existing_tests=(Path("tests/test_suite.py"),))
+    candidate = _make_candidate()
+
+    base_ev = service.execute_regression_baseline(plan)
+    # Manually overwrite registered settings on this instance to simulate mismatched branch coverage
+    service.register_evidence_settings(
+        evidence_id=base_ev.evidence_id,
+        source_root=source_dir,
+        cov_source="/workspace/src",
+        cov_branch=False,  # mismatch with service._cov_branch = True
+    )
+
+    cand_ev = service.execute_candidate(plan, candidate, baseline_evidence=base_ev)
+    assert cand_ev.line_coverage == 80.0
+    assert cand_ev.line_coverage_delta is None
+    assert cand_ev.branch_coverage_delta is None
+
+
+def test_bounded_settings_cache_eviction(source_dir: Path) -> None:
+    """Verifies that the instance-scoped settings cache is bounded to 50 entries via FIFO eviction."""
+    sandbox = SimulatedContainerSandboxManager()
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+
+    # Register 55 entries
+    for i in range(55):
+        service.register_evidence_settings(
+            evidence_id=f"ev-{i:03d}",
+            source_root=source_dir,
+            cov_source="/workspace/src",
+            cov_branch=True,
+        )
+
+    # Earliest 5 entries (0 to 4) should have been evicted
+    for i in range(5):
+        assert service.get_evidence_settings(f"ev-{i:03d}") is None
+
+    # Latest 50 entries (5 to 54) should be present
+    for i in range(5, 55):
+        assert service.get_evidence_settings(f"ev-{i:03d}") is not None

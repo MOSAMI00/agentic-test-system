@@ -9,8 +9,10 @@ import hashlib
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 import uuid
+
+from pydantic import BaseModel, ConfigDict
 
 from agentic_test.analysis.git_service import is_excluded_path
 from agentic_test.core.models import (
@@ -27,6 +29,18 @@ from agentic_test.core.protocols.sandbox import (
 from agentic_test.execution.coverage import CoverageExtractor, CoverageMetrics
 from agentic_test.execution.runner import PytestRunner, TestRunSummary
 from agentic_test.execution.staging import CandidateStagingArea, StagingValidationError
+
+
+class CoverageSettings(BaseModel):
+    """
+    Cryptographic and telemetry execution settings used for comparability checks.
+    Stage 3 Section 4.4.4.5, Stage 2 Section 4.3.2.5.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    source_root: str
+    cov_source: str
+    cov_branch: bool
 
 
 class ExecutionError(Exception):
@@ -104,6 +118,40 @@ class ExecutionService:
     7. Fail-closed cleanup of container, staging volume, and scratch mounts in all paths.
     """
 
+    def register_evidence_settings(
+        self,
+        evidence_id: str,
+        source_root: Union[Path, str],
+        cov_source: str,
+        cov_branch: bool,
+    ) -> None:
+        """
+        Explicitly registers coverage configuration settings for an ExecutionEvidence record
+        on this service instance. Ensures comparability invariants can be verified even
+        for pre-computed baselines.
+        """
+        if len(self._evidence_settings) >= 50:
+            oldest_key = next(iter(self._evidence_settings))
+            del self._evidence_settings[oldest_key]
+
+        self._evidence_settings[evidence_id] = CoverageSettings(
+            source_root=str(Path(source_root).resolve()),
+            cov_source=cov_source,
+            cov_branch=cov_branch,
+        )
+
+    def get_evidence_settings(self, evidence_id: str) -> Optional[CoverageSettings]:
+        """Returns the registered CoverageSettings for a given evidence record ID on this service instance."""
+        return self._evidence_settings.get(evidence_id)
+
+    def release_evidence_settings(self, evidence_id: str) -> None:
+        """Releases the registered CoverageSettings for a specific evidence record ID."""
+        self._evidence_settings.pop(evidence_id, None)
+
+    def clear_evidence_settings(self) -> None:
+        """Clears registered evidence coverage settings owned by this service instance."""
+        self._evidence_settings.clear()
+
     def __init__(
         self,
         sandbox_manager: SandboxManager,
@@ -118,6 +166,7 @@ class ExecutionService:
         cpu_quota: float = 1.0,
         pids_limit: int = 100,
         cov_source: str = "/workspace/src",
+        cov_branch: bool = True,
         environment_vars: Optional[Dict[str, str]] = None,
         keep_artifacts: bool = False,
     ) -> None:
@@ -136,6 +185,7 @@ class ExecutionService:
         :param cpu_quota: Confinement CPU quota ceiling (default 1.0, INV-01).
         :param pids_limit: Confinement process count ceiling (default 100, INV-01).
         :param cov_source: Path inside container to measure coverage on (default '/workspace/src').
+        :param cov_branch: Whether to measure branch coverage (default True, FR-15).
         :param environment_vars: Optional container environment variable overrides.
         :param keep_artifacts: If True, preserves staging and scratch directories for debugging.
         :raises ValueError: If source_root is None, does not exist, or is not a directory.
@@ -166,12 +216,14 @@ class ExecutionService:
         self._cpu_quota = cpu_quota
         self._pids_limit = pids_limit
         self._cov_source = cov_source
+        self._cov_branch = bool(cov_branch)
         self._environment_vars = dict(environment_vars or {})
         self._keep_artifacts = keep_artifacts
 
         self._last_summary: Optional[TestRunSummary] = None
         self._last_coverage: Optional[CoverageMetrics] = None
         self._last_evidence: Optional[ExecutionEvidence] = None
+        self._evidence_settings: Dict[str, CoverageSettings] = {}
 
     @property
     def source_root(self) -> Path:
@@ -194,6 +246,16 @@ class ExecutionService:
         return self._coverage_extractor
 
     @property
+    def cov_source(self) -> str:
+        """Configured coverage source path inside container."""
+        return self._cov_source
+
+    @property
+    def cov_branch(self) -> bool:
+        """Whether branch coverage measurement is enabled."""
+        return self._cov_branch
+
+    @property
     def last_summary(self) -> Optional[TestRunSummary]:
         """Parsed outcome summary from the most recent execution, if available."""
         return self._last_summary
@@ -213,6 +275,8 @@ class ExecutionService:
         plan: ExecutionPlan,
         candidate: TestCandidate,
         run_id: Optional[str] = None,
+        baseline_evidence: Optional[ExecutionEvidence] = None,
+        release_baseline: bool = True,
     ) -> ExecutionEvidence:
         """
         Convenience execution helper for a single TestCandidate.
@@ -220,14 +284,92 @@ class ExecutionService:
         :param plan: ExecutionPlan defining the run context.
         :param candidate: Single TestCandidate entity.
         :param run_id: Optional explicit run identifier.
+        :param baseline_evidence: Optional baseline evidence for coverage delta computation.
+        :param release_baseline: Whether to release baseline evidence settings after execution (default True).
         :return: Populated ExecutionEvidence record.
         """
-        return self.execute(
+        evs = self.execute_candidates(
             plan=plan,
             candidates=(candidate,),
+            baseline_evidence=baseline_evidence,
             run_id=run_id,
-            candidate_id=candidate.candidate_id,
+            release_baseline=release_baseline,
         )
+        return evs[0]
+
+    def execute_regression_baseline(
+        self,
+        plan: ExecutionPlan,
+        run_id: Optional[str] = None,
+    ) -> ExecutionEvidence:
+        """
+        Executes planned regression suite without candidates to capture baseline telemetry.
+
+        :param plan: ExecutionPlan defining the existing regression tests.
+        :param run_id: Optional explicit run identifier.
+        :return: ExecutionEvidence with candidate_id=None.
+        :raises ValueError: If plan.existing_tests_to_run is empty.
+        """
+        if not plan.existing_tests_to_run:
+            raise ValueError(
+                "ExecutionPlan.existing_tests_to_run cannot be empty for regression baseline execution."
+            )
+        return self.execute(
+            plan=plan,
+            candidates=(),
+            run_id=run_id,
+            candidate_id=None,
+            baseline_evidence=None,
+            release_baseline=False,
+        )
+
+    def execute_candidates(
+        self,
+        plan: ExecutionPlan,
+        candidates: Sequence[TestCandidate],
+        baseline_evidence: Optional[ExecutionEvidence] = None,
+        run_id: Optional[str] = None,
+        release_baseline: bool = True,
+    ) -> Tuple[ExecutionEvidence, ...]:
+        """
+        Executes candidates in isolated per-candidate container sessions (INV-01, INV-04).
+        Preserves deterministic input order.
+
+        :param plan: ExecutionPlan defining target symbols and routes.
+        :param candidates: Sequence of TestCandidate entities to execute.
+        :param baseline_evidence: Optional baseline evidence for coverage delta computation.
+        :param run_id: Optional explicit run identifier.
+        :param release_baseline: Whether to release baseline evidence settings after execution (default True).
+        :return: Tuple of ExecutionEvidence records corresponding to each candidate in input order.
+        :raises StagingValidationError: If any candidate has validation_status other than PASSED.
+        """
+        if not candidates:
+            return ()
+
+        # Fail fast if any candidate is not PASSED (INV-04)
+        for cand in candidates:
+            if cand.validation_status != ValidationStatus.PASSED:
+                raise StagingValidationError(
+                    f"Candidate '{cand.candidate_id}' has validation_status={cand.validation_status}. "
+                    "Only candidates with validation_status == PASSED can be executed (INV-04)."
+                )
+
+        evidences: List[ExecutionEvidence] = []
+        try:
+            for cand in candidates:
+                ev = self.execute(
+                    plan=plan,
+                    candidates=(cand,),
+                    run_id=run_id,
+                    candidate_id=cand.candidate_id,
+                    baseline_evidence=baseline_evidence,
+                    release_baseline=False,
+                )
+                evidences.append(ev)
+            return tuple(evidences)
+        finally:
+            if release_baseline and baseline_evidence is not None:
+                self.release_evidence_settings(baseline_evidence.evidence_id)
 
     def execute(
         self,
@@ -235,6 +377,8 @@ class ExecutionService:
         candidates: Sequence[TestCandidate] = (),
         run_id: Optional[str] = None,
         candidate_id: Optional[str] = None,
+        baseline_evidence: Optional[ExecutionEvidence] = None,
+        release_baseline: bool = True,
     ) -> ExecutionEvidence:
         """
         Orchestrates full sandboxed container execution and returns ExecutionEvidence.
@@ -244,11 +388,20 @@ class ExecutionService:
         :param candidates: Sequence of TestCandidate entities to execute.
         :param run_id: Optional explicit run identifier; defaults to candidate.run_id or plan.plan_id.
         :param candidate_id: Optional explicit candidate identifier for evidence linking.
+        :param baseline_evidence: Optional baseline evidence for coverage delta computation.
         :return: Immutable ExecutionEvidence containing exit codes, outputs, duration, and coverage.
         :raises SourceIntegrityError: If production source files were modified (INV-02).
         :raises StagingValidationError: If candidates were provided but none passed validation.
-        :raises ValueError: If neither candidates nor existing tests are available for execution.
+        :raises ValueError: If neither candidates nor existing tests are available for execution,
+                            or if multiple candidates are batched into a single execution session.
         """
+        # Batch execution of multiple candidates into a single container session is strictly prohibited (INV-04)
+        if len(candidates) > 1:
+            raise ValueError(
+                "Batch execution of multiple candidates in a single container session is prohibited. "
+                "Use execute_candidates() to execute candidates in isolated per-candidate sessions."
+            )
+
         # 1. Resolve effective identifiers
         effective_run_id = (
             run_id
@@ -274,11 +427,13 @@ class ExecutionService:
                 "No validated test candidates or existing tests available for execution."
             )
 
-        # Resolve effective candidate ID for relational evidence linkage
-        effective_candidate_id = (
-            candidate_id
-            or (passed_candidates[0].candidate_id if passed_candidates else "existing_tests")
-        )
+        # Resolve effective candidate ID: non-None for candidates, None for baseline
+        if candidate_id is not None:
+            effective_candidate_id: Optional[str] = candidate_id
+        elif passed_candidates:
+            effective_candidate_id = passed_candidates[0].candidate_id
+        else:
+            effective_candidate_id = None
 
         # 3. Step 1 of UC-05: Source integrity pre-hash recording (INV-02)
         try:
@@ -333,16 +488,22 @@ class ExecutionService:
 
             # 6. Construct deterministic pytest CLI tokens via PytestRunner
             cov_report_path = "/workspace/output/coverage.json"
+            tests_paths: List[str] = []
             if passed_candidates:
-                tests_path = "/workspace/tests"
-            else:
-                first_test = plan.existing_tests_to_run[0]
-                tests_path = f"/workspace/src/{first_test.as_posix()}"
+                tests_paths.append("/workspace/tests")
 
-            cmd = self._runner.construct_command(
-                tests_path=tests_path,
+            for existing_test in plan.existing_tests_to_run:
+                p_str = existing_test.as_posix()
+                if not p_str.startswith("/"):
+                    tests_paths.append(f"/workspace/src/{p_str}")
+                else:
+                    tests_paths.append(p_str)
+
+            cmd = self._runner.construct_command_for_paths(
+                tests_paths=tests_paths,
                 cov_source=self._cov_source,
                 cov_report_path=cov_report_path,
+                cov_branch=self._cov_branch,
             )
 
             # 7. Configure sandbox confinement (INV-01)
@@ -405,8 +566,8 @@ class ExecutionService:
                     )
                 else:
                     coverage_metrics = CoverageMetrics(
-                        line_coverage=0.0,
-                        branch_coverage=0.0,
+                        line_coverage=None,
+                        branch_coverage=None,
                         is_valid=False,
                         error_message=f"Coverage report file '{coverage_file}' not found.",
                     )
@@ -421,7 +582,41 @@ class ExecutionService:
             if op_error is not None:
                 raise op_error
 
-            # 12. Package immutable ExecutionEvidence entity
+            # 12. Compute coverage metrics & deltas against baseline
+            if coverage_metrics.is_valid:
+                cand_line_cov = coverage_metrics.line_coverage
+                cand_branch_cov = coverage_metrics.branch_coverage if self._cov_branch else None
+            else:
+                cand_line_cov = None
+                cand_branch_cov = None
+
+            line_cov_delta: Optional[float] = None
+            branch_cov_delta: Optional[float] = None
+
+            if (
+                baseline_evidence is not None
+                and baseline_evidence.exit_code == 0
+                and raw_result.exit_code == 0
+                and coverage_metrics.is_valid
+                and cand_line_cov is not None
+                and baseline_evidence.line_coverage is not None
+                and self._verify_settings_comparable(baseline_evidence)
+            ):
+                line_cov_delta = self._coverage_extractor.calculate_deltas(
+                    pre_cov=baseline_evidence.line_coverage,
+                    post_cov=cand_line_cov,
+                )
+                if (
+                    self._cov_branch
+                    and cand_branch_cov is not None
+                    and baseline_evidence.branch_coverage is not None
+                ):
+                    branch_cov_delta = self._coverage_extractor.calculate_deltas(
+                        pre_cov=baseline_evidence.branch_coverage,
+                        post_cov=cand_branch_cov,
+                    )
+
+            # Package immutable ExecutionEvidence entity
             evidence_id = f"ev-{uuid.uuid4().hex[:12]}"
             evidence = ExecutionEvidence(
                 evidence_id=evidence_id,
@@ -432,11 +627,22 @@ class ExecutionService:
                 stderr=raw_result.stderr,
                 duration_sec=raw_result.duration_sec,
                 timed_out=summary.timed_out,
-                line_coverage=coverage_metrics.line_coverage,
-                branch_coverage=coverage_metrics.branch_coverage,
+                line_coverage=cand_line_cov,
+                branch_coverage=cand_branch_cov,
+                line_coverage_delta=line_cov_delta,
+                branch_coverage_delta=branch_cov_delta,
                 traceback=summary.traceback,
                 created_at=datetime.now(timezone.utc),
             )
+
+            # Register coverage settings for valid baseline executions
+            if coverage_metrics.is_valid and effective_candidate_id is None:
+                self.register_evidence_settings(
+                    evidence_id=evidence.evidence_id,
+                    source_root=self._source_root,
+                    cov_source=self._cov_source,
+                    cov_branch=self._cov_branch,
+                )
 
             # Cache detailed telemetry for caller introspection
             self._last_summary = summary
@@ -452,6 +658,9 @@ class ExecutionService:
                 self._verify_source_integrity(pre_source_hash, chained_cause=err)
             raise
         finally:
+            if release_baseline and baseline_evidence is not None:
+                self.release_evidence_settings(baseline_evidence.evidence_id)
+
             # 13. Fail-closed ephemeral mount teardown
             if not self._keep_artifacts:
                 if staging_area is not None:
@@ -501,3 +710,24 @@ class ExecutionService:
             if chained_cause is not None:
                 raise SourceIntegrityError(msg) from chained_cause
             raise SourceIntegrityError(msg)
+
+    def _verify_settings_comparable(self, baseline_evidence: ExecutionEvidence) -> bool:
+        """
+        Verifies that baseline and candidate runs satisfy Identical Telemetry Invariants:
+        1. Same source_root
+        2. Same cov_source
+        3. Same cov_branch
+
+        :param baseline_evidence: The baseline ExecutionEvidence record.
+        :return: True if both runs used identical settings, False otherwise.
+        """
+        base_settings = self._evidence_settings.get(baseline_evidence.evidence_id)
+        if base_settings is None:
+            # Cannot infer comparability merely from numeric values (Requirement 6)
+            return False
+        current_settings = CoverageSettings(
+            source_root=str(self._source_root.resolve()),
+            cov_source=self._cov_source,
+            cov_branch=self._cov_branch,
+        )
+        return base_settings == current_settings

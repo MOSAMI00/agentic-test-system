@@ -356,3 +356,22 @@ def test_calculate_deltas_rejects_nan() -> None:
 
     with pytest.raises(ValueError, match="cannot be NaN"):
         extractor.calculate_deltas(pre_cov=50.0, post_cov=float("nan"))
+
+
+def test_calculate_deltas_with_none_returns_none() -> None:
+    """Verifies that calculate_deltas returns None if either input is None."""
+    extractor = CoverageExtractor()
+
+    assert extractor.calculate_deltas(pre_cov=None, post_cov=50.0) is None
+    assert extractor.calculate_deltas(pre_cov=50.0, post_cov=None) is None
+    assert extractor.calculate_deltas(pre_cov=None, post_cov=None) is None
+
+
+def test_calculate_deltas_boundary_values() -> None:
+    """Verifies boundary delta calculations at 0.0% and 100.0%."""
+    extractor = CoverageExtractor()
+
+    assert extractor.calculate_deltas(pre_cov=0.0, post_cov=100.0) == 100.0
+    assert extractor.calculate_deltas(pre_cov=100.0, post_cov=0.0) == -100.0
+    assert extractor.calculate_deltas(pre_cov=0.0, post_cov=0.0) == 0.0
+    assert extractor.calculate_deltas(pre_cov=100.0, post_cov=100.0) == 0.0
