@@ -391,3 +391,233 @@ def test_parse_test_outcomes_malformed_incomplete_output() -> None:
     assert summary.success is False
     assert "exit code 139" in summary.status_message
     assert summary.traceback == stdout
+
+
+# =====================================================================
+# 5. Pre-Iteration-1.6 Slice 2: Multi-Path & Collection Command Tests
+# =====================================================================
+
+def test_construct_command_for_paths_single_and_multiple_paths() -> None:
+    """Verifies CLI construction with single and multiple test paths with exact token ordering."""
+    runner = PytestRunner()
+
+    # Single path
+    cmd_single = runner.construct_command_for_paths(
+        tests_paths=["tests/test_single.py"],
+        cov_source="src",
+        cov_branch=True,
+    )
+    assert cmd_single == [
+        "pytest",
+        "tests/test_single.py",
+        "--cov=src",
+        "--cov-branch",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+    # Multiple paths
+    cmd_multi = runner.construct_command_for_paths(
+        tests_paths=[
+            Path("tests/unit/test_one.py"),
+            "tests/regression/test_two.py",
+            "tests/test_three.py",
+        ],
+        cov_source="src/pkg",
+        cov_report_path="/tmp/cov.json",
+        cov_branch=True,
+    )
+    assert cmd_multi == [
+        "pytest",
+        "tests/unit/test_one.py",
+        "tests/regression/test_two.py",
+        "tests/test_three.py",
+        "--cov=src/pkg",
+        "--cov-branch",
+        "--cov-report=json:/tmp/cov.json",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+
+def test_construct_command_for_paths_duplicate_removal_preserves_order() -> None:
+    """Verifies that duplicate test paths (including slash/backslash aliases) are deduplicated preserving first-seen order."""
+    runner = PytestRunner()
+    cmd = runner.construct_command_for_paths(
+        tests_paths=[
+            "tests/test_a.py",
+            "tests/test_b.py",
+            "tests/test_a.py",
+            "tests\\test_b.py",
+            "tests/test_c.py",
+            "tests/test_a.py",
+        ],
+        cov_source="src",
+        cov_branch=False,
+    )
+    assert cmd == [
+        "pytest",
+        "tests/test_a.py",
+        "tests/test_b.py",
+        "tests/test_c.py",
+        "--cov=src",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+
+def test_construct_command_for_paths_rejects_empty_sequence() -> None:
+    """Verifies that empty sequence of paths raises ValueError."""
+    runner = PytestRunner()
+
+    with pytest.raises(ValueError, match="'tests_paths' sequence cannot be empty"):
+        runner.construct_command_for_paths(tests_paths=[], cov_source="src")
+
+    with pytest.raises(ValueError, match="'tests_paths' sequence cannot be empty"):
+        runner.construct_command_for_paths(tests_paths=(), cov_source="src")
+
+
+def test_construct_command_for_paths_rejects_empty_individual_path() -> None:
+    """Verifies that empty string or whitespace path within sequence raises ValueError."""
+    runner = PytestRunner()
+
+    with pytest.raises(ValueError, match="'tests_paths' cannot be empty"):
+        runner.construct_command_for_paths(
+            tests_paths=["tests/test_a.py", ""],
+            cov_source="src",
+        )
+
+    with pytest.raises(ValueError, match="'tests_paths' cannot be empty"):
+        runner.construct_command_for_paths(
+            tests_paths=["   ", "tests/test_b.py"],
+            cov_source="src",
+        )
+
+
+def test_construct_command_for_paths_rejects_path_traversal() -> None:
+    """Verifies that directory traversal ('..') in any path item is strictly rejected."""
+    runner = PytestRunner()
+
+    with pytest.raises(ValueError, match="Path traversal .* not permitted in 'tests_paths'"):
+        runner.construct_command_for_paths(
+            tests_paths=["tests/test_a.py", "tests/../../etc/passwd"],
+            cov_source="src",
+        )
+
+
+def test_construct_command_for_paths_rejects_windows_drive_letter() -> None:
+    """Verifies that Windows drive letters in any path item are rejected."""
+    runner = PytestRunner()
+
+    with pytest.raises(ValueError, match="Windows drive-letter paths are not permitted .* 'tests_paths'"):
+        runner.construct_command_for_paths(
+            tests_paths=["tests/test_a.py", "C:/tests/test_b.py"],
+            cov_source="src",
+        )
+
+    with pytest.raises(ValueError, match="Windows drive-letter paths are not permitted .* 'tests_paths'"):
+        runner.construct_command_for_paths(
+            tests_paths=["D:\\workspace\\test.py"],
+            cov_source="src",
+        )
+
+
+def test_construct_command_for_paths_preserves_absolute_container_paths() -> None:
+    """Verifies that valid container-absolute paths are preserved without modification."""
+    runner = PytestRunner()
+    cmd = runner.construct_command_for_paths(
+        tests_paths=[
+            "/workspace/tests/test_one.py",
+            "/workspace/src/generated/test_two.py",
+        ],
+        cov_source="/workspace/src",
+        cov_branch=True,
+    )
+    assert cmd == [
+        "pytest",
+        "/workspace/tests/test_one.py",
+        "/workspace/src/generated/test_two.py",
+        "--cov=/workspace/src",
+        "--cov-branch",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+
+def test_construct_command_for_paths_cov_branch_flag_toggling() -> None:
+    """Verifies that cov_branch=True adds --cov-branch and cov_branch=False omits it."""
+    runner = PytestRunner()
+
+    cmd_true = runner.construct_command_for_paths(
+        tests_paths=["tests/test_mod.py"],
+        cov_source="src",
+        cov_branch=True,
+    )
+    assert "--cov-branch" in cmd_true
+    assert cmd_true == [
+        "pytest",
+        "tests/test_mod.py",
+        "--cov=src",
+        "--cov-branch",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+    cmd_false = runner.construct_command_for_paths(
+        tests_paths=["tests/test_mod.py"],
+        cov_source="src",
+        cov_branch=False,
+    )
+    assert "--cov-branch" not in cmd_false
+    assert cmd_false == [
+        "pytest",
+        "tests/test_mod.py",
+        "--cov=src",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+
+def test_construct_collection_command_exact_tokens() -> None:
+    """Verifies deterministic CLI construction for isolated test collection."""
+    runner = PytestRunner()
+
+    # Relative path
+    cmd = runner.construct_collection_command("tests/unit/test_candidate.py")
+    assert cmd == [
+        "pytest",
+        "tests/unit/test_candidate.py",
+        "--collect-only",
+        "-q",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+    # Container-absolute path with Path object
+    cmd_abs = runner.construct_collection_command(Path("/workspace/tests/test_staged.py"))
+    assert cmd_abs == [
+        "pytest",
+        "/workspace/tests/test_staged.py",
+        "--collect-only",
+        "-q",
+        "-o",
+        "cache_dir=/tmp/.pytest_cache",
+    ]
+
+    # Normalizes Windows backslashes
+    cmd_bs = runner.construct_collection_command("tests\\unit\\test_candidate.py")
+    assert cmd_bs[1] == "tests/unit/test_candidate.py"
+
+
+def test_construct_collection_command_validation_rejections() -> None:
+    """Verifies security validation constraints in collection command construction."""
+    runner = PytestRunner()
+
+    with pytest.raises(ValueError, match="'tests_path' cannot be empty"):
+        runner.construct_collection_command("")
+
+    with pytest.raises(ValueError, match="Path traversal .* not permitted in 'tests_path'"):
+        runner.construct_collection_command("../test_escape.py")
+
+    with pytest.raises(ValueError, match="Windows drive-letter paths are not permitted .* 'tests_path'"):
+        runner.construct_collection_command("C:/tests/test_staged.py")

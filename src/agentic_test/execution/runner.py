@@ -6,7 +6,7 @@ Iteration 1.5 Slice C.1.
 
 from pathlib import Path
 import re
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Set, Union
 from pydantic import BaseModel, ConfigDict
 
 
@@ -48,6 +48,7 @@ class PytestRunner:
         tests_path: Union[Path, str],
         cov_source: Union[Path, str],
         cov_report_path: Optional[Union[Path, str]] = None,
+        cov_branch: bool = False,
     ) -> List[str]:
         """
         Constructs deterministic pytest CLI invocation arguments for container execution.
@@ -55,18 +56,60 @@ class PytestRunner:
         :param tests_path: Path to target test file or directory within container.
         :param cov_source: Path to source code root for coverage instrumentation.
         :param cov_report_path: Optional path for JSON coverage report output.
+        :param cov_branch: Whether to enable branch coverage measurement (default False).
         :return: Deterministic list of CLI command tokens.
         :raises ValueError: If any path is empty, contains directory traversal ('..'),
                             or specifies a Windows drive letter.
         """
         clean_tests = self._validate_and_normalize_path(tests_path, "tests_path")
+        return self.construct_command_for_paths(
+            tests_paths=[clean_tests],
+            cov_source=cov_source,
+            cov_report_path=cov_report_path,
+            cov_branch=cov_branch,
+        )
+
+    def construct_command_for_paths(
+        self,
+        tests_paths: Sequence[Union[Path, str]],
+        cov_source: Union[Path, str],
+        cov_report_path: Optional[Union[Path, str]] = None,
+        cov_branch: bool = True,
+    ) -> List[str]:
+        """
+        Constructs deterministic pytest CLI invocation arguments for multiple test paths.
+
+        :param tests_paths: Sequence of test files or directory paths within container.
+        :param cov_source: Path to source code root for coverage instrumentation.
+        :param cov_report_path: Optional path for JSON coverage report output.
+        :param cov_branch: Whether to enable branch coverage measurement (default True).
+        :return: Deterministic list of CLI command tokens.
+        :raises ValueError: If tests_paths is empty, any path item is empty, contains traversal ('..'),
+                            or specifies a Windows drive letter.
+        """
+        if not tests_paths:
+            raise ValueError("'tests_paths' sequence cannot be empty")
+
         clean_cov = self._validate_and_normalize_path(cov_source, "cov_source")
 
-        tokens = [
-            "pytest",
-            clean_tests,
-            f"--cov={clean_cov}",
-        ]
+        seen: Set[str] = set()
+        normalized_paths: List[str] = []
+
+        for path_item in tests_paths:
+            norm = self._validate_and_normalize_path(path_item, "tests_paths")
+            if norm not in seen:
+                seen.add(norm)
+                normalized_paths.append(norm)
+
+        if not normalized_paths:
+            raise ValueError("'tests_paths' sequence cannot be empty")
+
+        tokens = ["pytest"]
+        tokens.extend(normalized_paths)
+        tokens.append(f"--cov={clean_cov}")
+
+        if cov_branch:
+            tokens.append("--cov-branch")
 
         if cov_report_path is not None:
             clean_report = self._validate_and_normalize_path(
@@ -76,6 +119,27 @@ class PytestRunner:
 
         tokens.extend(["-o", "cache_dir=/tmp/.pytest_cache"])
         return tokens
+
+    def construct_collection_command(
+        self,
+        tests_path: Union[Path, str],
+    ) -> List[str]:
+        """
+        Constructs deterministic pytest CLI invocation arguments for isolated candidate collection.
+
+        :param tests_path: Path to target test file or directory within container.
+        :return: Deterministic list of CLI command tokens.
+        :raises ValueError: If tests_path is empty, contains traversal, or specifies a Windows drive letter.
+        """
+        clean_tests = self._validate_and_normalize_path(tests_path, "tests_path")
+        return [
+            "pytest",
+            clean_tests,
+            "--collect-only",
+            "-q",
+            "-o",
+            "cache_dir=/tmp/.pytest_cache",
+        ]
 
     def parse_test_outcomes(
         self,
