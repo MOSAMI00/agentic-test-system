@@ -4,6 +4,7 @@ Iteration 1.4 Component Architecture.
 """
 
 from agentic_test.validation.base import BaseValidator
+from agentic_test.validation.collection import CollectionValidator
 from agentic_test.validation.models import ValidationResult
 from agentic_test.validation.pipeline import ValidationPipeline
 from agentic_test.validation.security import SecurityValidator
@@ -14,5 +15,6 @@ __all__ = [
     "BaseValidator",
     "SyntaxValidator",
     "SecurityValidator",
+    "CollectionValidator",
     "ValidationResult",
 ]

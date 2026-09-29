@@ -181,29 +181,10 @@ class CandidateStagingArea:
                 raise StagingPathError(f"Refusing to write to or through symlink: {curr}")
             curr = curr.parent
 
-    def stage_candidate(self, candidate: TestCandidate) -> Path:
+    def _write_candidate_artifact(self, candidate: TestCandidate) -> Path:
         """
-        Stages a single statically validated test candidate to disk.
-
-        :param candidate: TestCandidate with validation_status == PASSED.
-        :return: Absolute Path to the staged Python test file.
-        :raises StagingValidationError: If candidate is not PASSED or has empty code.
-        :raises StagingPathError: If candidate.test_file_path violates isolation boundaries or is a symlink.
+        Internal helper to normalize destination, verify boundaries, and write candidate artifact.
         """
-        # Gate check 1: rejected or unvalidated candidates must NEVER be staged for execution
-        if candidate.validation_status != ValidationStatus.PASSED:
-            raise StagingValidationError(
-                f"Candidate '{candidate.candidate_id}' cannot be staged for execution: "
-                f"validation_status is '{candidate.validation_status.value}', "
-                f"expected '{ValidationStatus.PASSED.value}'."
-            )
-
-        # Gate check 2: reject empty or whitespace-only candidate code
-        if not candidate.candidate_code or not candidate.candidate_code.strip():
-            raise StagingValidationError(
-                f"Candidate '{candidate.candidate_id}' cannot be staged: candidate_code is empty or whitespace."
-            )
-
         # Idempotent re-staging: if candidate was already assigned a path, re-use it
         if candidate.candidate_id in self._candidate_to_path:
             target_path = self._candidate_to_path[candidate.candidate_id]
@@ -252,6 +233,63 @@ class CandidateStagingArea:
         self._path_to_candidate[candidate_dest] = candidate.candidate_id
 
         return candidate_dest
+
+    def stage_candidate(self, candidate: TestCandidate) -> Path:
+        """
+        Stages a single statically validated test candidate to disk.
+
+        :param candidate: TestCandidate with validation_status == PASSED.
+        :return: Absolute Path to the staged Python test file.
+        :raises StagingValidationError: If candidate is not PASSED or has empty code.
+        :raises StagingPathError: If candidate.test_file_path violates isolation boundaries or is a symlink.
+        """
+        # Gate check 1: rejected or unvalidated candidates must NEVER be staged for execution
+        if candidate.validation_status != ValidationStatus.PASSED:
+            raise StagingValidationError(
+                f"Candidate '{candidate.candidate_id}' cannot be staged for execution: "
+                f"validation_status is '{candidate.validation_status.value}', "
+                f"expected '{ValidationStatus.PASSED.value}'."
+            )
+
+        # Gate check 2: reject empty or whitespace-only candidate code
+        if not candidate.candidate_code or not candidate.candidate_code.strip():
+            raise StagingValidationError(
+                f"Candidate '{candidate.candidate_id}' cannot be staged: candidate_code is empty or whitespace."
+            )
+
+        return self._write_candidate_artifact(candidate)
+
+    def stage_candidate_for_collection(
+        self,
+        candidate: TestCandidate,
+        static_gates_passed: bool = False,
+    ) -> Path:
+        """
+        Stages a single candidate to disk strictly for isolated containerized collection validation (Gate 3).
+
+        :param candidate: TestCandidate that has verified static gate approval.
+        :param static_gates_passed: Explicit boolean certifying that Gates 1 and 2 passed.
+        :return: Absolute Path to the staged Python test file.
+        :raises StagingValidationError: If static_gates_passed is False, candidate status is invalid, or code is empty.
+        """
+        if not static_gates_passed:
+            raise StagingValidationError(
+                f"Candidate '{candidate.candidate_id}' cannot be staged for collection: "
+                "static_gates_passed=True is required (Gates 1 & 2 must pass before collection staging)."
+            )
+
+        if candidate.validation_status not in (ValidationStatus.PENDING, ValidationStatus.PASSED):
+            raise StagingValidationError(
+                f"Candidate '{candidate.candidate_id}' has validation_status='{candidate.validation_status.value}'. "
+                "Rejected or quarantined candidates must never be staged for collection."
+            )
+
+        if not candidate.candidate_code or not candidate.candidate_code.strip():
+            raise StagingValidationError(
+                f"Candidate '{candidate.candidate_id}' cannot be staged for collection: code is empty or whitespace."
+            )
+
+        return self._write_candidate_artifact(candidate)
 
     def stage_candidates(self, candidates: Iterable[TestCandidate]) -> List[Path]:
         """
@@ -304,3 +342,29 @@ class CandidateStagingArea:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._auto_cleanup:
             self.cleanup()
+
+
+class CollectionStagingArea(CandidateStagingArea):
+    """
+    Dedicated ephemeral staging boundary for Gate 3 pytest collection validation.
+    Enforces that only candidates with verified static gate approval (Gates 1 & 2)
+    can be staged for container collection.
+    """
+
+    def stage_candidate(
+        self,
+        candidate: TestCandidate,
+        static_gates_passed: bool = False,
+    ) -> Path:
+
+        """
+        Stages a single candidate strictly for collection validation.
+
+        :param candidate: TestCandidate that passed static validation.
+        :param static_gates_passed: Explicit flag indicating Gates 1 and 2 passed.
+        :return: Absolute Path to the staged Python test file.
+        """
+        return self.stage_candidate_for_collection(
+            candidate=candidate,
+            static_gates_passed=static_gates_passed,
+        )

@@ -9,11 +9,15 @@ import pytest
 from pydantic import ValidationError
 
 from agentic_test.core.models import TestCandidate, ValidationStatus
+from agentic_test.core.protocols.sandbox import ExecutionRawResult
+from agentic_test.execution.mock_sandbox import MockSandboxManager
 from agentic_test.validation.base import BaseValidator
+from agentic_test.validation.collection import CollectionValidator
 from agentic_test.validation.models import ValidationResult
 from agentic_test.validation.pipeline import ValidationPipeline
 from agentic_test.validation.security import SecurityValidator
 from agentic_test.validation.syntax import SyntaxValidator
+
 
 
 def _make_candidate(
@@ -21,9 +25,10 @@ def _make_candidate(
     imports: tuple[str, ...] = ("import pytest",),
     status: ValidationStatus = ValidationStatus.PENDING,
     quarantine_reason: str | None = None,
+    candidate_id: str = "tc-val-001",
 ) -> TestCandidate:
     return TestCandidate(
-        candidate_id="tc-val-001",
+        candidate_id=candidate_id,
         run_id="run-val-001",
         target_symbol_name="pkg.calc.add",
         test_file_path=Path("tests/test_calc.py"),
@@ -32,6 +37,7 @@ def _make_candidate(
         validation_status=status,
         quarantine_reason=quarantine_reason,
     )
+
 
 
 # -------------------------------------------------------------------------
@@ -447,3 +453,133 @@ def test_validation_pipeline_reconstruct_candidate_rejects_invalid_enum_status()
         assert reconstructed.validation_status == valid_status
         assert reconstructed.candidate_id == cand.candidate_id
         assert reconstructed.created_at == cand.created_at
+
+
+# -------------------------------------------------------------------------
+# Gate 3 Containerized Collection Pipeline Integration Tests
+# -------------------------------------------------------------------------
+
+def test_validation_pipeline_short_circuits_before_collection_on_gate_1_syntax() -> None:
+    """Pipeline with collection validator short-circuits at Gate 1 without calling sandbox."""
+    sandbox = MockSandboxManager()
+    pipeline = ValidationPipeline(sandbox_manager=sandbox)
+
+    cand = _make_candidate(code="def test_broken(:\n    assert True")
+    updated_cand, result = pipeline.validate_candidate(cand)
+
+    assert updated_cand.validation_status == ValidationStatus.REJECTED_SYNTAX
+    assert result.status == ValidationStatus.REJECTED_SYNTAX
+    assert result.gate == "GATE_1_SYNTAX"
+    assert sandbox.call_count == 0
+
+
+def test_validation_pipeline_short_circuits_before_collection_on_gate_2_security() -> None:
+    """Pipeline with collection validator short-circuits at Gate 2 without calling sandbox."""
+    sandbox = MockSandboxManager()
+    pipeline = ValidationPipeline(sandbox_manager=sandbox)
+
+    cand = _make_candidate(code="import os\ndef test_ok(): pass", imports=("import os",))
+    updated_cand, result = pipeline.validate_candidate(cand)
+
+    assert updated_cand.validation_status == ValidationStatus.REJECTED_SECURITY
+    assert result.status == ValidationStatus.REJECTED_SECURITY
+    assert result.gate == "GATE_2_SECURITY"
+    assert sandbox.call_count == 0
+
+
+def test_validation_pipeline_full_gates_pass_with_collection() -> None:
+    """Pipeline passes candidate through Gate 1, Gate 2, and Gate 3 Collection to PASSED."""
+    sandbox = MockSandboxManager()
+    sandbox.enqueue_result(
+        ExecutionRawResult(
+            exit_code=0,
+            stdout="tests/test_calc.py::test_clean\n1 test collected in 0.01s\n",
+            stderr="",
+            duration_sec=0.1,
+            timed_out=False,
+            oom_killed=False,
+        )
+    )
+    pipeline = ValidationPipeline(sandbox_manager=sandbox)
+
+    cand = _make_candidate(code="def test_clean():\n    assert 1 + 1 == 2\n")
+    updated_cand, result = pipeline.validate_candidate(cand)
+
+    assert updated_cand.validation_status == ValidationStatus.PASSED
+    assert result.status == ValidationStatus.PASSED
+    assert result.gate == "GATE_3_COLLECTION"
+    assert result.passed is True
+    assert sandbox.call_count == 1
+
+
+def test_validation_pipeline_collection_failure_rejects_candidate() -> None:
+    """Candidate passing Gates 1 and 2 is rejected with REJECTED_COLLECTION if collection fails."""
+    sandbox = MockSandboxManager()
+    sandbox.enqueue_result(
+        ExecutionRawResult(
+            exit_code=2,
+            stdout="ERROR collecting tests/test_calc.py\n",
+            stderr="ModuleNotFoundError: No module named 'nonexistent_lib'\n",
+            duration_sec=0.1,
+            timed_out=False,
+            oom_killed=False,
+        )
+    )
+    pipeline = ValidationPipeline(sandbox_manager=sandbox)
+
+    cand = _make_candidate(code="def test_clean():\n    assert 1 + 1 == 2\n")
+    updated_cand, result = pipeline.validate_candidate(cand)
+
+    assert updated_cand.validation_status == ValidationStatus.REJECTED_COLLECTION
+    assert result.status == ValidationStatus.REJECTED_COLLECTION
+    assert result.gate == "GATE_3_COLLECTION"
+    assert result.passed is False
+    assert sandbox.call_count == 1
+
+
+def test_validation_pipeline_batch_candidate_isolation() -> None:
+    """Verifies that multiple candidates in a batch execute in isolated containers."""
+    sandbox = MockSandboxManager()
+    # c1 passes collection
+    sandbox.enqueue_result(
+        ExecutionRawResult(
+            exit_code=0,
+            stdout="tests/test_calc.py::test_c1\n1 test collected\n",
+            stderr="",
+            duration_sec=0.1,
+            timed_out=False,
+            oom_killed=False,
+        )
+    )
+    # c2 fails collection (0 tests collected)
+    sandbox.enqueue_result(
+        ExecutionRawResult(
+            exit_code=0,
+            stdout="collected 0 items\n",
+            stderr="",
+            duration_sec=0.1,
+            timed_out=False,
+            oom_killed=False,
+        )
+    )
+
+    pipeline = ValidationPipeline(sandbox_manager=sandbox)
+    c1 = _make_candidate(code="def test_c1(): pass\n", candidate_id="c1")
+    c2 = _make_candidate(code="def test_c2(): pass\n", candidate_id="c2")
+
+    results = pipeline.validate_candidates([c1, c2])
+    assert len(results) == 2
+
+    cand1, res1 = results[0]
+    cand2, res2 = results[1]
+
+    assert cand1.validation_status == ValidationStatus.PASSED
+    assert res1.passed is True
+    assert cand1.candidate_id == "c1"
+
+    assert cand2.validation_status == ValidationStatus.REJECTED_COLLECTION
+    assert res2.passed is False
+    assert cand2.candidate_id == "c2"
+
+    # Exactly 2 container sessions, one per candidate
+    assert sandbox.call_count == 2
