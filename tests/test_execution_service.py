@@ -50,11 +50,18 @@ class SimulatedContainerSandboxManager(MockSandboxManager):
         tamper_target: Optional[Path] = None,
         default_result: Optional[ExecutionRawResult] = None,
         execute_error: Optional[Exception] = None,
+        cleanup_error: Optional[Exception] = None,
     ) -> None:
         super().__init__(default_result=default_result)
         self.coverage_payload = coverage_payload
         self.tamper_target = tamper_target
         self.execute_error = execute_error
+        self.cleanup_error = cleanup_error
+
+    def cleanup(self, container_id: str) -> None:
+        super().cleanup(container_id)
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
 
     def execute_command(
         self,
@@ -62,6 +69,13 @@ class SimulatedContainerSandboxManager(MockSandboxManager):
         command: List[str],
         workdir: str = "/workspace",
     ) -> ExecutionRawResult:
+        # Simulate host tampering to verify INV-02 violation detection
+        if self.tamper_target is not None and self.tamper_target.exists():
+            if self.tamper_target.is_file():
+                self.tamper_target.write_text("TAMPERED_CONTENT\n", encoding="utf-8")
+            elif self.tamper_target.is_dir():
+                (self.tamper_target / "malicious.py").write_text("# injected\n", encoding="utf-8")
+
         if self.execute_error is not None:
             raise self.execute_error
 
@@ -76,14 +90,15 @@ class SimulatedContainerSandboxManager(MockSandboxManager):
                         self.coverage_payload, encoding="utf-8"
                     )
 
-        # Simulate host tampering to verify INV-02 violation detection
-        if self.tamper_target is not None and self.tamper_target.exists():
-            if self.tamper_target.is_file():
-                self.tamper_target.write_text("TAMPERED_CONTENT\n", encoding="utf-8")
-            elif self.tamper_target.is_dir():
-                (self.tamper_target / "malicious.py").write_text("# injected\n", encoding="utf-8")
-
         return super().execute_command(container_id, command, workdir)
+
+
+@pytest.fixture
+def source_dir(tmp_path: Path) -> Path:
+    src = tmp_path / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "sample.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+    return src
 
 
 def _make_candidate(
@@ -222,7 +237,7 @@ def test_successful_candidate_execution(tmp_path: Path) -> None:
     ]
 
 
-def test_failing_candidate_captures_traceback(tmp_path: Path) -> None:
+def test_failing_candidate_captures_traceback(source_dir: Path) -> None:
     """
     Verifies that test assertion failure (exit code 1) captures the diagnostic
     traceback into ExecutionEvidence without raising an unhandled exception.
@@ -242,7 +257,7 @@ def test_failing_candidate_captures_traceback(tmp_path: Path) -> None:
         duration_sec=0.15,
     )
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan()
     candidate = _make_candidate()
 
@@ -258,7 +273,7 @@ def test_failing_candidate_captures_traceback(tmp_path: Path) -> None:
     assert service.last_summary.success is False
 
 
-def test_collection_error_captured(tmp_path: Path) -> None:
+def test_collection_error_captured(source_dir: Path) -> None:
     """
     Verifies that pytest collection errors (exit code 2) are captured cleanly.
     """
@@ -270,7 +285,7 @@ def test_collection_error_captured(tmp_path: Path) -> None:
         duration_sec=0.08,
     )
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan()
     candidate = _make_candidate()
 
@@ -283,7 +298,7 @@ def test_collection_error_captured(tmp_path: Path) -> None:
     assert service.last_summary.errors == 1
 
 
-def test_no_tests_collected_exit_code_5(tmp_path: Path) -> None:
+def test_no_tests_collected_exit_code_5(source_dir: Path) -> None:
     """
     Verifies that exit code 5 (no tests collected) is recorded properly in evidence.
     """
@@ -294,7 +309,7 @@ def test_no_tests_collected_exit_code_5(tmp_path: Path) -> None:
         duration_sec=0.02,
     )
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan()
     candidate = _make_candidate()
 
@@ -310,7 +325,7 @@ def test_no_tests_collected_exit_code_5(tmp_path: Path) -> None:
 # 2. Timeout & Resource Limits Confinement Tests (INV-01)
 # =====================================================================
 
-def test_execution_timeout_inv01() -> None:
+def test_execution_timeout_inv01(source_dir: Path) -> None:
     """
     Verifies that container timeout (exit code 124) sets timed_out=True
     on the resulting ExecutionEvidence entity (UC-05 Extension 6a).
@@ -318,7 +333,7 @@ def test_execution_timeout_inv01() -> None:
     sandbox = SimulatedContainerSandboxManager()
     sandbox.script_timeout(duration_sec=30.0)
 
-    service = ExecutionService(sandbox_manager=sandbox, timeout_sec=30.0)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir, timeout_sec=30.0)
     plan = _make_plan()
     candidate = _make_candidate()
 
@@ -331,7 +346,7 @@ def test_execution_timeout_inv01() -> None:
     assert service.last_summary.timed_out is True
 
 
-def test_execution_oom_killed_inv01() -> None:
+def test_execution_oom_killed_inv01(source_dir: Path) -> None:
     """
     Verifies that container memory exhaustion (exit code 137) is parsed as OOM
     (UC-05 Extension 6b).
@@ -339,7 +354,7 @@ def test_execution_oom_killed_inv01() -> None:
     sandbox = SimulatedContainerSandboxManager()
     sandbox.script_oom(duration_sec=0.5)
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan()
     candidate = _make_candidate()
 
@@ -449,7 +464,7 @@ def test_source_integrity_violation_raises_error_inv02(tmp_path: Path) -> None:
 # 4. Coverage Extraction & Edge Cases
 # =====================================================================
 
-def test_missing_coverage_json_handled_safely() -> None:
+def test_missing_coverage_json_handled_safely(source_dir: Path) -> None:
     """
     Verifies that when coverage.json is absent, line_coverage defaults to 0.0
     and is_valid is marked False without crashing.
@@ -457,7 +472,7 @@ def test_missing_coverage_json_handled_safely() -> None:
     sandbox = SimulatedContainerSandboxManager(coverage_payload=None)
     sandbox.script_success()
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan()
     candidate = _make_candidate()
 
@@ -470,14 +485,14 @@ def test_missing_coverage_json_handled_safely() -> None:
     assert "not found" in (service.last_coverage.error_message or "").lower()
 
 
-def test_malformed_coverage_json_handled_safely() -> None:
+def test_malformed_coverage_json_handled_safely(source_dir: Path) -> None:
     """
     Verifies that malformed coverage JSON falls back gracefully without crashing.
     """
     sandbox = SimulatedContainerSandboxManager(coverage_payload="{not-valid-json}")
     sandbox.script_success()
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan()
     candidate = _make_candidate()
 
@@ -493,7 +508,7 @@ def test_malformed_coverage_json_handled_safely() -> None:
 # 5. Fail-Closed Cleanup & Error Guarantees
 # =====================================================================
 
-def test_container_and_mounts_cleaned_up_on_sandbox_execution_error(tmp_path: Path) -> None:
+def test_container_and_mounts_cleaned_up_on_sandbox_execution_error(tmp_path: Path, source_dir: Path) -> None:
     """
     Verifies that if SandboxManager.execute_command raises an exception,
     the container is terminated and ephemeral staging directories are removed.
@@ -509,6 +524,7 @@ def test_container_and_mounts_cleaned_up_on_sandbox_execution_error(tmp_path: Pa
 
     service = ExecutionService(
         sandbox_manager=sandbox,
+        source_root=source_dir,
         staging_root=staging_root,
         scratch_root=scratch_root,
     )
@@ -527,7 +543,7 @@ def test_container_and_mounts_cleaned_up_on_sandbox_execution_error(tmp_path: Pa
     assert list(scratch_root.iterdir()) == []
 
 
-def test_mounts_cleaned_up_on_sandbox_initialization_error(tmp_path: Path) -> None:
+def test_mounts_cleaned_up_on_sandbox_initialization_error(tmp_path: Path, source_dir: Path) -> None:
     """
     Verifies that if SandboxManager.create_environment fails (SandboxInitializationError),
     ephemeral staging and scratch directories are still reliably cleaned up.
@@ -542,6 +558,7 @@ def test_mounts_cleaned_up_on_sandbox_initialization_error(tmp_path: Path) -> No
 
     service = ExecutionService(
         sandbox_manager=sandbox,
+        source_root=source_dir,
         staging_root=staging_root,
         scratch_root=scratch_root,
     )
@@ -559,13 +576,13 @@ def test_mounts_cleaned_up_on_sandbox_initialization_error(tmp_path: Path) -> No
     assert list(scratch_root.iterdir()) == []
 
 
-def test_unvalidated_candidates_rejected_inv04(tmp_path: Path) -> None:
+def test_unvalidated_candidates_rejected_inv04(source_dir: Path) -> None:
     """
     Verifies that candidates without validation_status == PASSED are rejected
     before staging and never executed (INV-04).
     """
     sandbox = SimulatedContainerSandboxManager()
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
 
     plan = _make_plan()
     bad_cand = _make_candidate(status=ValidationStatus.REJECTED_SECURITY)
@@ -578,12 +595,12 @@ def test_unvalidated_candidates_rejected_inv04(tmp_path: Path) -> None:
     assert sandbox.active_containers == []
 
 
-def test_empty_candidates_and_no_existing_tests_rejected() -> None:
+def test_empty_candidates_and_no_existing_tests_rejected(source_dir: Path) -> None:
     """
     Verifies that an error is raised when neither candidates nor existing tests are provided.
     """
     sandbox = SimulatedContainerSandboxManager()
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan(existing_tests=())
 
     with pytest.raises(ValueError) as exc_info:
@@ -593,14 +610,14 @@ def test_empty_candidates_and_no_existing_tests_rejected() -> None:
     assert sandbox.call_count == 0
 
 
-def test_existing_tests_execution_without_candidates(tmp_path: Path) -> None:
+def test_existing_tests_execution_without_candidates(source_dir: Path) -> None:
     """
     Verifies execution of existing repository tests when candidates sequence is empty.
     """
     sandbox = SimulatedContainerSandboxManager()
     sandbox.script_success(stdout="=== 5 passed in 0.8s ===\n")
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan(
         plan_id="plan-regression-01",
         existing_tests=(Path("tests/test_suite.py"),),
@@ -618,14 +635,14 @@ def test_existing_tests_execution_without_candidates(tmp_path: Path) -> None:
     assert cmd[1] == "/workspace/src/tests/test_suite.py"
 
 
-def test_execute_candidate_convenience_method() -> None:
+def test_execute_candidate_convenience_method(source_dir: Path) -> None:
     """
     Verifies the execute_candidate convenience helper.
     """
     sandbox = SimulatedContainerSandboxManager()
     sandbox.script_success(stdout="=== 1 passed in 0.1s ===\n")
 
-    service = ExecutionService(sandbox_manager=sandbox)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
     plan = _make_plan()
     cand = _make_candidate(candidate_id="cand-singular-42")
 
@@ -635,7 +652,7 @@ def test_execute_candidate_convenience_method() -> None:
     assert evidence.candidate_id == "cand-singular-42"
 
 
-def test_keep_artifacts_preserves_directories(tmp_path: Path) -> None:
+def test_keep_artifacts_preserves_directories(tmp_path: Path, source_dir: Path) -> None:
     """
     Verifies that keep_artifacts=True preserves staging and scratch directories for inspection.
     """
@@ -649,6 +666,7 @@ def test_keep_artifacts_preserves_directories(tmp_path: Path) -> None:
 
     service = ExecutionService(
         sandbox_manager=sandbox,
+        source_root=source_dir,
         staging_root=staging_root,
         scratch_root=scratch_root,
         keep_artifacts=True,
@@ -693,3 +711,164 @@ def test_compute_tree_hash_determinism(tmp_path: Path) -> None:
     # Modifying a tracked file must change the hash
     (root / "a.py").write_text("a = 999\n", encoding="utf-8")
     assert compute_tree_hash(root) != hash1
+
+
+# =====================================================================
+# 7. Pre-Iteration-1.6 Slice 3: Fail-Closed Source Integrity Tests
+# =====================================================================
+
+def test_source_root_missing_rejected(tmp_path: Path) -> None:
+    """Verifies that non-existent source_root path or None is rejected immediately with ValueError."""
+    sandbox = SimulatedContainerSandboxManager()
+
+    # None rejected
+    with pytest.raises(ValueError, match="'source_root' is mandatory and cannot be None"):
+        ExecutionService(sandbox_manager=sandbox, source_root=None)  # type: ignore[arg-type]
+
+    # Non-existent path rejected
+    non_existent = tmp_path / "does_not_exist"
+    with pytest.raises(ValueError, match="'source_root' path does not exist"):
+        ExecutionService(sandbox_manager=sandbox, source_root=non_existent)
+
+
+def test_source_root_file_rejected(tmp_path: Path) -> None:
+    """Verifies that pointing source_root to a file instead of a directory is rejected with ValueError."""
+    sandbox = SimulatedContainerSandboxManager()
+    file_path = tmp_path / "regular_file.txt"
+    file_path.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="'source_root' must be a directory"):
+        ExecutionService(sandbox_manager=sandbox, source_root=file_path)
+
+
+def test_source_root_hash_checked_after_execute_exception(source_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that source integrity post-hash is attempted even when execute_command raises an exception."""
+    hash_call_count = 0
+    import agentic_test.execution.service as svc_mod
+    original_compute = svc_mod.compute_tree_hash
+
+    def counting_compute_hash(root: Path) -> str:
+        nonlocal hash_call_count
+        hash_call_count += 1
+        return original_compute(root)
+
+    monkeypatch.setattr(svc_mod, "compute_tree_hash", counting_compute_hash)
+
+    sandbox = SimulatedContainerSandboxManager(
+        execute_error=RuntimeError("Container daemon execution failure")
+    )
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    candidate = _make_candidate()
+
+    with pytest.raises(RuntimeError, match="Container daemon execution failure"):
+        service.execute(plan, [candidate])
+
+    # Pre-execution hash + post-execution hash attempted
+    assert hash_call_count >= 2
+
+
+def test_source_root_hash_checked_after_timeout_and_oom_result(source_dir: Path) -> None:
+    """Verifies that source integrity post-hash is verified on timeout and OOM execution results."""
+    # 1. Timeout
+    sandbox_timeout = SimulatedContainerSandboxManager()
+    sandbox_timeout.script_timeout(duration_sec=30.0)
+    service_timeout = ExecutionService(sandbox_manager=sandbox_timeout, source_root=source_dir)
+
+    ev_timeout = service_timeout.execute(_make_plan(), [_make_candidate()])
+    assert ev_timeout.exit_code == 124
+    assert ev_timeout.timed_out is True
+
+    # 2. OOM
+    sandbox_oom = SimulatedContainerSandboxManager()
+    sandbox_oom.script_oom(duration_sec=0.5)
+    service_oom = ExecutionService(sandbox_manager=sandbox_oom, source_root=source_dir)
+
+    ev_oom = service_oom.execute(_make_plan(), [_make_candidate()])
+    assert ev_oom.exit_code == 137
+    assert service_oom.last_summary is not None
+    assert service_oom.last_summary.oom_killed is True
+
+
+def test_source_modification_plus_execute_failure_raises_source_integrity_error(source_dir: Path) -> None:
+    """Verifies that source modification takes precedence over execution error, chaining the operational error."""
+    target_file = source_dir / "sample.py"
+    exec_err = RuntimeError("Docker socket broke during exec")
+
+    sandbox = SimulatedContainerSandboxManager(
+        tamper_target=target_file,
+        execute_error=exec_err,
+    )
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    candidate = _make_candidate()
+
+    with pytest.raises(SourceIntegrityError) as exc_info:
+        service.execute(plan, [candidate])
+
+    assert "INV-02 violated" in str(exc_info.value)
+    # Operational error must be preserved as chained cause
+    assert exc_info.value.__cause__ is exec_err
+
+
+def test_source_modification_plus_cleanup_failure_raises_source_integrity_error(source_dir: Path) -> None:
+    """Verifies that source modification takes precedence over container cleanup failure, chaining the operational error."""
+    target_file = source_dir / "sample.py"
+    cleanup_err = RuntimeError("Docker container cleanup failed: daemon unreachable")
+
+    sandbox = SimulatedContainerSandboxManager(
+        tamper_target=target_file,
+        cleanup_error=cleanup_err,
+    )
+    sandbox.script_success()
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    candidate = _make_candidate()
+
+    with pytest.raises(SourceIntegrityError) as exc_info:
+        service.execute(plan, [candidate])
+
+    assert "INV-02 violated" in str(exc_info.value)
+    # Cleanup error must be preserved as chained cause
+    assert exc_info.value.__cause__ is cleanup_err
+
+
+def test_post_hash_computation_failure_raises_source_integrity_error(source_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that failure to compute the post-execution hash raises SourceIntegrityError."""
+    import agentic_test.execution.service as svc_mod
+    original_compute = svc_mod.compute_tree_hash
+    call_count = 0
+
+    def fail_on_second_hash(root: Path) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count > 1:
+            raise OSError("I/O error reading source directory")
+        return original_compute(root)
+
+    monkeypatch.setattr(svc_mod, "compute_tree_hash", fail_on_second_hash)
+
+    sandbox = SimulatedContainerSandboxManager()
+    sandbox.script_success()
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    candidate = _make_candidate()
+
+    with pytest.raises(SourceIntegrityError) as exc_info:
+        service.execute(plan, [candidate])
+
+    assert "Failed to compute post-execution source tree hash" in str(exc_info.value)
+
+
+def test_clean_source_with_execute_failure_reraises_original_exception(source_dir: Path) -> None:
+    """Verifies that when source files are clean, an execution failure re-raises original operational error unchanged."""
+    exec_err = RuntimeError("Subprocess exec failure in container")
+    sandbox = SimulatedContainerSandboxManager(execute_error=exec_err)
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    plan = _make_plan()
+    candidate = _make_candidate()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        service.execute(plan, [candidate])
+
+    assert exc_info.value is exec_err

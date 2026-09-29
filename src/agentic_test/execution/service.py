@@ -20,6 +20,7 @@ from agentic_test.core.models import (
     ValidationStatus,
 )
 from agentic_test.core.protocols.sandbox import (
+    ExecutionRawResult,
     SandboxConfig,
     SandboxManager,
 )
@@ -106,9 +107,9 @@ class ExecutionService:
     def __init__(
         self,
         sandbox_manager: SandboxManager,
+        source_root: Path,
         runner: Optional[PytestRunner] = None,
         coverage_extractor: Optional[CoverageExtractor] = None,
-        source_root: Optional[Path] = None,
         staging_root: Optional[Path] = None,
         scratch_root: Optional[Path] = None,
         timeout_sec: float = 30.0,
@@ -124,9 +125,9 @@ class ExecutionService:
         Initializes the ExecutionService orchestrator.
 
         :param sandbox_manager: Real or mock implementation of SandboxManager protocol.
+        :param source_root: Path to repository application source on host (mounted at /workspace/src:ro).
         :param runner: PytestRunner instance for command construction and telemetry parsing.
         :param coverage_extractor: CoverageExtractor instance for JSON coverage parsing.
-        :param source_root: Path to repository application source on host (mounted at /workspace/src:ro).
         :param staging_root: Root path for ephemeral candidate staging (mounted at /workspace/tests:ro).
         :param scratch_root: Root path for ephemeral execution outputs (mounted at /workspace/output:rw).
         :param timeout_sec: Container execution wall-clock timeout ceiling (default 30.0s, FR-13).
@@ -137,11 +138,26 @@ class ExecutionService:
         :param cov_source: Path inside container to measure coverage on (default '/workspace/src').
         :param environment_vars: Optional container environment variable overrides.
         :param keep_artifacts: If True, preserves staging and scratch directories for debugging.
+        :raises ValueError: If source_root is None, does not exist, or is not a directory.
         """
+        if source_root is None:
+            raise ValueError("'source_root' is mandatory and cannot be None.")
+        if not isinstance(source_root, Path):
+            try:
+                source_root = Path(source_root)
+            except Exception as err:
+                raise ValueError(f"Invalid 'source_root': {err}") from err
+
+        resolved_source = source_root.resolve()
+        if not resolved_source.exists():
+            raise ValueError(f"'source_root' path does not exist: {resolved_source}")
+        if not resolved_source.is_dir():
+            raise ValueError(f"'source_root' must be a directory, but got file: {resolved_source}")
+
         self._sandbox_manager = sandbox_manager
+        self._source_root: Path = resolved_source
         self._runner = runner or PytestRunner()
         self._coverage_extractor = coverage_extractor or CoverageExtractor()
-        self._source_root = source_root.resolve() if source_root else None
         self._staging_root = staging_root.resolve() if staging_root else None
         self._scratch_root = scratch_root.resolve() if scratch_root else None
         self._timeout_sec = timeout_sec
@@ -156,6 +172,11 @@ class ExecutionService:
         self._last_summary: Optional[TestRunSummary] = None
         self._last_coverage: Optional[CoverageMetrics] = None
         self._last_evidence: Optional[ExecutionEvidence] = None
+
+    @property
+    def source_root(self) -> Path:
+        """Configured application source root path on host."""
+        return self._source_root
 
     @property
     def sandbox_manager(self) -> SandboxManager:
@@ -260,14 +281,19 @@ class ExecutionService:
         )
 
         # 3. Step 1 of UC-05: Source integrity pre-hash recording (INV-02)
-        pre_source_hash: Optional[str] = None
-        if self._source_root is not None and self._source_root.exists():
+        try:
             pre_source_hash = compute_tree_hash(self._source_root)
+        except Exception as err:
+            raise SourceIntegrityError(
+                f"Safety Invariant INV-02 violated: Failed to compute pre-execution source hash "
+                f"for '{self._source_root}': {err}"
+            ) from err
 
         # 4. Set up ephemeral staging area and scratch output directory
         staging_area: Optional[CandidateStagingArea] = None
         scratch_dir: Optional[Path] = None
         created_staging_dir: Optional[Path] = None
+        integrity_verified = False
 
         try:
             # Create run-scoped staging area
@@ -294,9 +320,9 @@ class ExecutionService:
                 scratch_dir = Path(tempfile.mkdtemp(prefix="agentic_scratch_"))
 
             # 5. Build volume isolation mounts (Stage 3 Section 4.4.4.5)
-            read_only_mounts: Dict[Path, str] = {}
-            if self._source_root is not None and self._source_root.exists():
-                read_only_mounts[self._source_root] = "/workspace/src"
+            read_only_mounts: Dict[Path, str] = {
+                self._source_root: "/workspace/src",
+            }
 
             if passed_candidates:
                 read_only_mounts[staging_area.tests_dir] = "/workspace/tests"
@@ -334,6 +360,9 @@ class ExecutionService:
 
             # 8. Container lifecycle execution with guaranteed cleanup
             container_id: Optional[str] = None
+            raw_result: Optional[ExecutionRawResult] = None
+            op_error: Optional[BaseException] = None
+
             try:
                 container_id = self._sandbox_manager.create_environment(sandbox_config)
                 raw_result = self._sandbox_manager.execute_command(
@@ -341,47 +370,56 @@ class ExecutionService:
                     command=cmd,
                     workdir="/workspace",
                 )
+            except Exception as e:
+                op_error = e
             finally:
                 if container_id is not None:
                     try:
                         self._sandbox_manager.cleanup(container_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if op_error is None:
+                            op_error = e
 
-            # 9. Step 9 of UC-05: Source integrity post-hash verification (INV-02)
-            if pre_source_hash is not None and self._source_root is not None:
-                post_source_hash = compute_tree_hash(self._source_root)
-                if post_source_hash != pre_source_hash:
-                    raise SourceIntegrityError(
-                        f"Safety Invariant INV-02 violated: Production source files under "
-                        f"'{self._source_root}' were modified during test execution! "
-                        f"Pre-execution SHA-256: {pre_source_hash}, "
-                        f"Post-execution SHA-256: {post_source_hash}. "
-                        f"Halting immediately (UC-05 Extension 9a)."
+            # If container execution or cleanup failed, verify source integrity immediately
+            if op_error is not None:
+                self._verify_source_integrity(pre_source_hash, chained_cause=op_error)
+                integrity_verified = True
+                raise op_error
+
+            # 9. Parse test outcomes & captured telemetry
+            assert raw_result is not None
+            try:
+                summary = self._runner.parse_test_outcomes(
+                    stdout=raw_result.stdout,
+                    stderr=raw_result.stderr,
+                    exit_code=raw_result.exit_code,
+                )
+
+                # 10. Parse coverage telemetry from generated coverage.json
+                coverage_file = scratch_dir / "coverage.json"
+                coverage_metrics: CoverageMetrics
+                if coverage_file.is_file():
+                    coverage_metrics = self._coverage_extractor.parse_coverage_json(
+                        coverage_file,
+                        strict=False,
                     )
+                else:
+                    coverage_metrics = CoverageMetrics(
+                        line_coverage=0.0,
+                        branch_coverage=0.0,
+                        is_valid=False,
+                        error_message=f"Coverage report file '{coverage_file}' not found.",
+                    )
+            except Exception as e:
+                op_error = e
 
-            # 10. Parse test outcomes & captured telemetry
-            summary = self._runner.parse_test_outcomes(
-                stdout=raw_result.stdout,
-                stderr=raw_result.stderr,
-                exit_code=raw_result.exit_code,
-            )
+            # 11. Step 9 of UC-05: Source integrity post-hash verification (INV-02)
+            # Verify after container cleanup and before staging/artifact cleanup on all termination paths
+            self._verify_source_integrity(pre_source_hash, chained_cause=op_error)
+            integrity_verified = True
 
-            # 11. Parse coverage telemetry from generated coverage.json
-            coverage_file = scratch_dir / "coverage.json"
-            coverage_metrics: CoverageMetrics
-            if coverage_file.is_file():
-                coverage_metrics = self._coverage_extractor.parse_coverage_json(
-                    coverage_file,
-                    strict=False,
-                )
-            else:
-                coverage_metrics = CoverageMetrics(
-                    line_coverage=0.0,
-                    branch_coverage=0.0,
-                    is_valid=False,
-                    error_message=f"Coverage report file '{coverage_file}' not found.",
-                )
+            if op_error is not None:
+                raise op_error
 
             # 12. Package immutable ExecutionEvidence entity
             evidence_id = f"ev-{uuid.uuid4().hex[:12]}"
@@ -407,6 +445,12 @@ class ExecutionService:
 
             return evidence
 
+        except SourceIntegrityError:
+            raise
+        except Exception as err:
+            if not integrity_verified:
+                self._verify_source_integrity(pre_source_hash, chained_cause=err)
+            raise
         finally:
             # 13. Fail-closed ephemeral mount teardown
             if not self._keep_artifacts:
@@ -420,3 +464,40 @@ class ExecutionService:
 
                 if scratch_dir is not None and scratch_dir.exists():
                     shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    def _verify_source_integrity(
+        self,
+        pre_source_hash: str,
+        chained_cause: Optional[BaseException] = None,
+    ) -> None:
+        """
+        Verifies that source_root files were not modified during execution (INV-02).
+
+        :param pre_source_hash: SHA-256 tree hash recorded before container provisioning.
+        :param chained_cause: Any operational exception encountered prior to verification.
+        :raises SourceIntegrityError: If post-hash cannot be computed or differs from pre-hash.
+        """
+        try:
+            if not self._source_root.exists() or not self._source_root.is_dir():
+                raise OSError(f"Source root '{self._source_root}' is missing or not a directory.")
+            post_source_hash = compute_tree_hash(self._source_root)
+        except Exception as err:
+            msg = (
+                f"Safety Invariant INV-02 violated: Failed to compute post-execution source tree hash "
+                f"for '{self._source_root}': {err}"
+            )
+            if chained_cause is not None:
+                raise SourceIntegrityError(msg) from chained_cause
+            raise SourceIntegrityError(msg) from err
+
+        if post_source_hash != pre_source_hash:
+            msg = (
+                f"Safety Invariant INV-02 violated: Production source files under "
+                f"'{self._source_root}' were modified during test execution! "
+                f"Pre-execution SHA-256: {pre_source_hash}, "
+                f"Post-execution SHA-256: {post_source_hash}. "
+                f"Halting immediately (UC-05 Extension 9a)."
+            )
+            if chained_cause is not None:
+                raise SourceIntegrityError(msg) from chained_cause
+            raise SourceIntegrityError(msg)

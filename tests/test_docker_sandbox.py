@@ -363,3 +363,97 @@ def test_no_network_access_during_mocked_docker_sandbox(monkeypatch: pytest.Monk
     manager.cleanup(cid)
 
     assert not network_called, "Zero network or daemon socket connections allowed in offline tests."
+
+
+# =====================================================================
+# 7. Partial Creation & Fail-Closed Cleanup Tests (Slice 3)
+# =====================================================================
+
+def test_partial_container_start_failure_removes_container() -> None:
+    """Verifies that container creation followed by start() failure forces container removal."""
+    client = DummyDockerClient()
+    manager = DockerSandboxManager(client=client)
+
+    original_create = client.containers.create
+    created_container: Optional[DummyContainer] = None
+
+    def failing_create(**kwargs: Any) -> DummyContainer:
+        nonlocal created_container
+        cont = original_create(**kwargs)
+        created_container = cont
+
+        def fail_start() -> None:
+            raise RuntimeError("Docker daemon start failure: out of resources")
+
+        cont.start = fail_start  # type: ignore[method-assign]
+        return cont
+
+    client.containers.create = failing_create  # type: ignore[method-assign]
+
+    with pytest.raises(SandboxInitializationError) as exc_info:
+        manager.create_environment(SandboxConfig())
+
+    assert "Docker daemon start failure" in str(exc_info.value)
+    assert exc_info.value.__cause__ is not None
+    assert "out of resources" in str(exc_info.value.__cause__)
+    assert created_container is not None
+    assert created_container.removed is True
+    assert created_container.remove_kwargs == {"force": True}
+    assert manager.active_containers == []
+
+
+def test_partial_container_registration_failure_removes_container() -> None:
+    """Verifies that container creation followed by internal registration failure forces container removal."""
+    client = DummyDockerClient()
+    manager = DockerSandboxManager(client=client)
+
+    class FailingDict(Dict[str, float]):
+        def __setitem__(self, key: str, val: float) -> None:
+            raise RuntimeError("Internal state registration error")
+
+    manager._container_timeouts = FailingDict()
+
+    with pytest.raises(SandboxInitializationError) as exc_info:
+        manager.create_environment(SandboxConfig())
+
+    assert "Internal state registration error" in str(exc_info.value)
+    assert manager.active_containers == []
+    assert len(client.containers.containers) == 1
+    created = list(client.containers.containers.values())[0]
+    assert created.removed is True
+    assert created.remove_kwargs == {"force": True}
+
+
+def test_cleanup_failure_does_not_mask_initialization_failure() -> None:
+    """Verifies that a failure during container.remove() does not mask primary start failure."""
+    client = DummyDockerClient()
+    manager = DockerSandboxManager(client=client)
+
+    original_create = client.containers.create
+    created_container: Optional[DummyContainer] = None
+
+    def failing_create(**kwargs: Any) -> DummyContainer:
+        nonlocal created_container
+        cont = original_create(**kwargs)
+        created_container = cont
+
+        def fail_start() -> None:
+            raise RuntimeError("Primary start failure")
+
+        def fail_remove(**remove_kwargs: Any) -> None:
+            raise RuntimeError("Secondary remove failure: daemon socket disconnected")
+
+        cont.start = fail_start  # type: ignore[method-assign]
+        cont.remove = fail_remove  # type: ignore[method-assign]
+        return cont
+
+    client.containers.create = failing_create  # type: ignore[method-assign]
+
+    with pytest.raises(SandboxInitializationError) as exc_info:
+        manager.create_environment(SandboxConfig())
+
+    assert "Primary start failure" in str(exc_info.value)
+    assert exc_info.value.__cause__ is not None
+    assert "Primary start failure" in str(exc_info.value.__cause__)
+    assert "Secondary remove failure" not in str(exc_info.value)
+    assert manager.active_containers == []

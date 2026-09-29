@@ -123,6 +123,8 @@ class DockerSandboxManager(SandboxManager):
         if config.environment_vars:
             create_kwargs["environment"] = dict(config.environment_vars)
 
+        container: Any = None
+        container_id: Optional[str] = None
         try:
             container = client.containers.create(**create_kwargs)
             container.start()
@@ -131,6 +133,20 @@ class DockerSandboxManager(SandboxManager):
             self._container_timeouts[container_id] = config.timeout_sec
             return container_id
         except Exception as err:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+
+            if container_id is not None:
+                self._active_containers.discard(container_id)
+                self._container_timeouts.pop(container_id, None)
+            elif container is not None and hasattr(container, "id"):
+                cid_str = str(container.id)
+                self._active_containers.discard(cid_str)
+                self._container_timeouts.pop(cid_str, None)
+
             raise SandboxInitializationError(
                 f"Docker daemon failed to provision container: {err}"
             ) from err
