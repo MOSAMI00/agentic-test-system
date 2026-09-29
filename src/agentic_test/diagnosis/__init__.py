@@ -11,10 +11,12 @@ from agentic_test.diagnosis.rules import (
     DeterministicRuleClassifier,
     RuleClassificationResult,
 )
+from agentic_test.diagnosis.service import DiagnosisService
 
 __all__ = [
     "CognitiveLLMClassifier",
     "DeterministicRuleClassifier",
     "DiagnosisResponseSchema",
+    "DiagnosisService",
     "RuleClassificationResult",
 ]

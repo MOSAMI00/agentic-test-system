@@ -6,6 +6,7 @@ WBS 1.6.1A / FR-18.
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
+import uuid
 import pytest
 from pydantic import ValidationError
 
@@ -14,9 +15,11 @@ from agentic_test.core.models import (
     DiffHunk,
     ExecutionEvidence,
     FailureCategory,
+    FailureDiagnosis,
     SymbolContract,
     SymbolType,
     TestCandidate,
+    TriageEngine,
 )
 from agentic_test.diagnosis.llm_classifier import (
     CognitiveLLMClassifier,
@@ -26,6 +29,7 @@ from agentic_test.diagnosis.rules import (
     DeterministicRuleClassifier,
     RuleClassificationResult,
 )
+from agentic_test.diagnosis.service import DiagnosisService
 from agentic_test.generation.exceptions import (
     LLMCommunicationError,
     SchemaValidationError,
@@ -798,3 +802,268 @@ def test_diagnosis_response_schema_validation_and_immutability() -> None:
 
     with pytest.raises(ValidationError):
         setattr(valid_schema, "category", FailureCategory.UNKNOWN)
+
+
+# =============================================================================
+# 10. DiagnosisService Facade Tests (Slice 1.6.1C)
+# =============================================================================
+
+def test_service_deterministic_timeout_bypasses_cognitive() -> None:
+    """Verifies that deterministic timeout bypasses cognitive LLM calls."""
+    mock_llm = MockLLMService()
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=124, timed_out=True)
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.triage_engine == TriageEngine.DETERMINISTIC_RULE
+    assert diagnosis.canonical_category == FailureCategory.ENVIRONMENT_FAILURE
+    assert diagnosis.confidence == 1.0
+    assert diagnosis.is_application_bug is False
+    assert mock_llm.call_count == 0
+
+
+def test_service_deterministic_oom_bypasses_cognitive() -> None:
+    """Verifies that deterministic OOM bypasses cognitive LLM calls."""
+    mock_llm = MockLLMService()
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=137)
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.triage_engine == TriageEngine.DETERMINISTIC_RULE
+    assert diagnosis.canonical_category == FailureCategory.ENVIRONMENT_FAILURE
+    assert diagnosis.confidence == 1.0
+    assert diagnosis.is_application_bug is False
+    assert mock_llm.call_count == 0
+
+
+def test_service_deterministic_import_error_bypasses_cognitive() -> None:
+    """Verifies that deterministic import error bypasses cognitive LLM calls."""
+    mock_llm = MockLLMService()
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(
+        exit_code=2,
+        stderr="ModuleNotFoundError: No module named 'target_pkg'",
+    )
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.triage_engine == TriageEngine.DETERMINISTIC_RULE
+    assert diagnosis.canonical_category == FailureCategory.CONFIGURATION_ERROR
+    assert diagnosis.confidence == 1.0
+    assert diagnosis.is_application_bug is False
+    assert mock_llm.call_count == 0
+
+
+def test_service_deterministic_collection_error_bypasses_cognitive() -> None:
+    """Verifies that deterministic collection error bypasses cognitive LLM calls."""
+    mock_llm = MockLLMService()
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(
+        exit_code=2,
+        stdout="ERROR collecting tests/test_candidate.py\nfixture 'db' not found",
+    )
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.triage_engine == TriageEngine.DETERMINISTIC_RULE
+    assert diagnosis.canonical_category == FailureCategory.INVALID_GENERATED_TEST
+    assert diagnosis.confidence == 1.0
+    assert diagnosis.is_application_bug is False
+    assert mock_llm.call_count == 0
+
+
+def test_service_ambiguous_failure_invokes_cognitive_exactly_once() -> None:
+    """Verifies that ambiguous failure cascades to cognitive triage exactly once."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.TEST_OUTDATED,
+        confidence=0.88,
+        explanation="Target interface signature changed in patch.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(
+        exit_code=1,
+        traceback="AssertionError: assert calculate() == 1",
+    )
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.triage_engine == TriageEngine.COGNITIVE_LLM
+    assert diagnosis.canonical_category == FailureCategory.TEST_OUTDATED
+    assert diagnosis.confidence == 0.88
+    assert diagnosis.is_application_bug is False
+    assert mock_llm.call_count == 1
+
+
+def test_service_application_bug_flags_is_application_bug_true() -> None:
+    """Verifies that APPLICATION_BUG strictly sets is_application_bug=True."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.94,
+        explanation="Regression in production algorithm detected by test.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.canonical_category == FailureCategory.APPLICATION_BUG
+    assert diagnosis.is_application_bug is True
+    assert diagnosis.triage_engine == TriageEngine.COGNITIVE_LLM
+    assert mock_llm.call_count == 1
+
+
+def test_service_low_confidence_produces_unknown_and_bug_flag_false() -> None:
+    """Verifies that low confidence LLM response normalizes to UNKNOWN with is_application_bug=False."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.62,
+        explanation="Possible bug but uncertain.",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.canonical_category == FailureCategory.UNKNOWN
+    assert diagnosis.is_application_bug is False
+    assert diagnosis.confidence == 0.62
+    assert "Low confidence" in diagnosis.explanation
+
+
+def test_service_llm_failure_produces_fallback_diagnosis() -> None:
+    """Verifies that LLM communication failure produces LLM_FAILURE diagnosis without crashing."""
+    mock_llm = MockLLMService()
+    mock_llm.enqueue_error(LLMCommunicationError("Gateway timed out"))
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+    diagnosis = service.diagnose(evidence)
+
+    assert diagnosis.canonical_category == FailureCategory.LLM_FAILURE
+    assert diagnosis.confidence == 0.0
+    assert diagnosis.is_application_bug is False
+    assert "communication failed" in diagnosis.explanation.lower()
+
+
+def test_service_uuid4_diagnosis_id_and_evidence_linkage() -> None:
+    """Verifies that diagnosis_id is a unique UUID4 and links directly to evidence_id."""
+    canned_1 = DiagnosisResponseSchema(
+        category=FailureCategory.INVALID_GENERATED_TEST,
+        confidence=0.85,
+        explanation="Reason 1",
+    )
+    canned_2 = DiagnosisResponseSchema(
+        category=FailureCategory.INVALID_GENERATED_TEST,
+        confidence=0.85,
+        explanation="Reason 2",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned_1, canned_2])
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(evidence_id="ev-fixed-123", exit_code=1, traceback="AssertionError")
+
+    diag_1 = service.diagnose(evidence)
+    diag_2 = service.diagnose(evidence)
+
+    # UUID4 validation
+    parsed_uuid_1 = uuid.UUID(diag_1.diagnosis_id)
+    parsed_uuid_2 = uuid.UUID(diag_2.diagnosis_id)
+    assert parsed_uuid_1.version == 4
+    assert parsed_uuid_2.version == 4
+    assert diag_1.diagnosis_id != diag_2.diagnosis_id
+
+    # Evidence linkage
+    assert diag_1.evidence_id == "ev-fixed-123"
+    assert diag_2.evidence_id == "ev-fixed-123"
+
+
+def test_service_candidate_context_preserved_without_mutation() -> None:
+    """Verifies that caller-owned evidence and candidate are not mutated during diagnosis."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.90,
+        explanation="Regression bug",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    service = DiagnosisService(llm_service=mock_llm)
+
+    evidence = _make_evidence(
+        evidence_id="ev-preserved",
+        candidate_id="cand-preserved",
+        exit_code=1,
+        traceback="AssertionError",
+    )
+    candidate = TestCandidate(
+        candidate_id="cand-preserved",
+        run_id="run-test",
+        target_symbol_name="my_func",
+        test_file_path=Path("tests/test_my_func.py"),
+        candidate_code="def test_my_func(): assert my_func() == 1",
+    )
+
+    evidence_dump_before = evidence.model_dump()
+    candidate_dump_before = candidate.model_dump()
+
+    diagnosis = service.diagnose(
+        evidence=evidence,
+        candidate=candidate,
+        candidate_code=candidate.candidate_code,
+        target_symbol="my_func",
+        target_source="def my_func(): return 2",
+        diff_content="@@ -1 +1 @@\n- return 1\n+ return 2",
+    )
+
+    assert diagnosis.evidence_id == "ev-preserved"
+    assert evidence.model_dump() == evidence_dump_before
+    assert candidate.model_dump() == candidate_dump_before
+
+
+def test_service_initialization_with_injected_components() -> None:
+    """Verifies flexible injection of classifiers, LLMService, and error on missing dependencies."""
+    mock_llm = MockLLMService()
+    cog_classifier = CognitiveLLMClassifier(llm_service=mock_llm)
+    rule_classifier = DeterministicRuleClassifier()
+
+    # Via LLMService
+    svc1 = DiagnosisService(llm_service=mock_llm)
+    assert svc1._cognitive_classifier is not None
+
+    # Via CognitiveLLMClassifier
+    svc2 = DiagnosisService(
+        rule_classifier=rule_classifier,
+        cognitive_classifier=cog_classifier,
+    )
+    assert svc2._rule_classifier is rule_classifier
+    assert svc2._cognitive_classifier is cog_classifier
+
+    # Missing both raises ValueError
+    with pytest.raises(ValueError, match="requires either a CognitiveLLMClassifier or an LLMService"):
+        DiagnosisService()
+
+
+def test_service_no_external_calls_or_auto_repair() -> None:
+    """Verifies that DiagnosisService performs zero subprocess, network, or OS calls."""
+    canned = DiagnosisResponseSchema(
+        category=FailureCategory.APPLICATION_BUG,
+        confidence=0.88,
+        explanation="Detected application bug",
+    )
+    mock_llm = MockLLMService(canned_responses=[canned])
+    service = DiagnosisService(llm_service=mock_llm)
+    evidence = _make_evidence(exit_code=1, traceback="AssertionError")
+
+    with patch("builtins.open") as mock_open, \
+         patch("subprocess.run") as mock_sub_run, \
+         patch("socket.socket") as mock_socket:
+
+        diagnosis = service.diagnose(evidence)
+
+        assert diagnosis.canonical_category == FailureCategory.APPLICATION_BUG
+        mock_open.assert_not_called()
+        mock_sub_run.assert_not_called()
+        mock_socket.assert_not_called()
