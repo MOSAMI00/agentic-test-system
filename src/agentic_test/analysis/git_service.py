@@ -167,7 +167,12 @@ class GitService:
         # Automatic base resolution
         head = repo.head.commit
         if head.parents:
-            return head.parents[0].hexsha
+            try:
+                parent_sha = head.parents[0].hexsha
+                repo.commit(parent_sha)
+                return parent_sha
+            except (GitError, BadName, BadObject, ValueError):
+                return head.hexsha
         return head.hexsha
 
     def get_file_content_at_commit(self, commit_sha: str, rel_path: Path) -> str:
