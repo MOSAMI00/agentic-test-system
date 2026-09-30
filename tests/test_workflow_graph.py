@@ -42,6 +42,11 @@ from agentic_test.workflow.nodes import (
     report_node,
     validate_candidates_node,
 )
+from agentic_test.workflow.recovery import (
+    RecoveryError,
+    WorkflowRecoveryService,
+    resume_run,
+)
 
 
 # ============================================================================
@@ -714,3 +719,576 @@ def test_engine_immutability(repo: SQLiteRepository, event_store: SQLiteEventSto
     assert final_state.snapshot == snapshot
     assert final_state.plan == plan
 
+
+# ============================================================================
+# 4. Crash Recovery and Checkpoint Resumption Tests (WBS 1.6.3B)
+# ============================================================================
+
+def test_recovery_missing_checkpoint_raises(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that attempting to resume a run with no checkpoints raises RecoveryError."""
+    engine = WorkflowEngine(repository=repo, event_store=event_store)
+    with pytest.raises(RecoveryError, match="No checkpoint found for run 'unknown-run'"):
+        resume_run("unknown-run", engine)
+
+
+def test_recovery_terminal_run_completed_rejected(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that attempting to resume an already COMPLETED run is rejected with RecoveryError."""
+    engine = WorkflowEngine(repository=repo, event_store=event_store)
+    state = _make_state(run_id="run-done")
+    repo.save_run(
+        run_id="run-done",
+        repo_path=state.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="COMPLETED",
+    )
+    repo.save_checkpoint(state=state, step_index=2, node_name="plan_execution_node")
+
+    with pytest.raises(RecoveryError, match="already in terminal status 'COMPLETED'"):
+        resume_run("run-done", engine)
+
+
+def test_recovery_terminal_run_failed_rejected(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that attempting to resume a FAILED run is rejected with RecoveryError."""
+    engine = WorkflowEngine(repository=repo, event_store=event_store)
+    state = _make_state(run_id="run-failed")
+    repo.save_run(
+        run_id="run-failed",
+        repo_path=state.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="FAILED",
+    )
+    repo.save_checkpoint(state=state, step_index=2, node_name="plan_execution_node")
+
+    with pytest.raises(RecoveryError, match="already in terminal status 'FAILED'"):
+        resume_run("run-failed", engine)
+
+
+def test_recovery_terminal_checkpoint_step_7_rejected(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that attempting to resume from checkpoint step 7 is rejected as terminal."""
+    engine = WorkflowEngine(repository=repo, event_store=event_store)
+    state = _make_state(run_id="run-step7").model_copy(update={"final_status": "COMPLETED"})
+    repo.save_run(
+        run_id="run-step7",
+        repo_path=state.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=state, step_index=7, node_name="report_node")
+
+    with pytest.raises(RecoveryError, match="is terminal"):
+        resume_run("run-step7", engine)
+
+
+def test_recovery_latest_checkpoint_selection(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that resumption deterministically selects the latest checkpoint."""
+    run_id = "run-multi-cp"
+    state_0 = _make_state(run_id=run_id)
+    snapshot = _make_snapshot()
+    state_1 = state_0.model_copy(update={"snapshot": snapshot})
+    plan = _make_plan(route=WorkflowRoute.ROUTE_NO_OP)
+    state_2 = state_1.model_copy(update={"plan": plan})
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_0.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=state_0, step_index=0, node_name="initialized")
+    repo.save_checkpoint(state=state_1, step_index=1, node_name="ingest_and_analyze_node")
+    repo.save_checkpoint(state=state_2, step_index=2, node_name="plan_execution_node")
+
+    mock_analysis = MagicMock()
+    mock_planner = MagicMock()
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        analysis_service=mock_analysis,
+        planner=mock_planner,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    # Started from checkpoint 2 -> ROUTE_NO_OP transitions to report_node (step 7)
+    assert final_state.final_status == "COMPLETED"
+    mock_analysis.analyze.assert_not_called()  # Step 1 not re-executed
+    mock_planner.plan.assert_not_called()     # Step 2 not re-executed
+
+    # RUN_RESUMED event emitted with latest checkpoint details
+    events = event_store.get_events(run_id)
+    resume_events = [e for e in events if e.event_type == "RUN_RESUMED"]
+    assert len(resume_events) == 1
+    assert resume_events[0].payload["step_index"] == 2
+    assert resume_events[0].payload["node_name"] == "plan_execution_node"
+
+
+def test_recovery_from_checkpoint_0_initialized(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies resumption from step 0 executes ingest_and_analyze_node next."""
+    run_id = "run-cp0"
+    state_0 = _make_state(run_id=run_id)
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_NO_OP)
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_0.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="INITIALIZED",
+    )
+    repo.save_checkpoint(state=state_0, step_index=0, node_name="initialized")
+
+    mock_analysis = MagicMock(analyze=MagicMock(return_value=snapshot))
+    mock_planner = MagicMock(plan=MagicMock(return_value=plan))
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        analysis_service=mock_analysis,
+        planner=mock_planner,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    mock_analysis.analyze.assert_called_once()
+    mock_planner.plan.assert_called_once()
+
+    checkpoints = repo.get_checkpoints(run_id)
+    assert [cp.step_index for cp in checkpoints] == [0, 1, 2, 7]
+
+
+def test_recovery_from_checkpoint_1_analysis(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies resumption from step 1 executes plan_execution_node next and does not re-analyze."""
+    run_id = "run-cp1"
+    snapshot = _make_snapshot()
+    state_1 = _make_state(run_id=run_id, snapshot=snapshot)
+    plan = _make_plan(route=WorkflowRoute.ROUTE_NO_OP)
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_1.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=state_1, step_index=1, node_name="ingest_and_analyze_node")
+
+    mock_analysis = MagicMock()
+    mock_planner = MagicMock(plan=MagicMock(return_value=plan))
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        analysis_service=mock_analysis,
+        planner=mock_planner,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    mock_analysis.analyze.assert_not_called()  # Analysis NOT repeated
+    mock_planner.plan.assert_called_once()
+
+    checkpoints = repo.get_checkpoints(run_id)
+    assert [cp.step_index for cp in checkpoints] == [1, 2, 7]
+
+
+def test_recovery_from_checkpoint_2_planning(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies resumption from step 2 routes to generate_tests_node without repeating planning."""
+    run_id = "run-cp2"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
+    state_2 = _make_state(run_id=run_id, snapshot=snapshot, plan=plan)
+
+    cand = _make_candidate(run_id=run_id, status=ValidationStatus.PASSED)
+    ev = _make_evidence(run_id=run_id, exit_code=0)
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_2.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=state_2, step_index=2, node_name="plan_execution_node")
+
+    mock_analysis = MagicMock()
+    mock_planner = MagicMock()
+    mock_gen = MagicMock(generate=MagicMock(return_value=[cand]))
+    mock_val = MagicMock(validate_candidates=MagicMock(return_value=[(cand, MagicMock(passed=True))]))
+    mock_exec = MagicMock(execute_candidates=MagicMock(return_value=(ev,)))
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        analysis_service=mock_analysis,
+        planner=mock_planner,
+        generation_service=mock_gen,
+        validation_pipeline=mock_val,
+        execution_service=mock_exec,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    mock_analysis.analyze.assert_not_called()
+    mock_planner.plan.assert_not_called()
+    mock_gen.generate.assert_called_once()
+    mock_val.validate_candidates.assert_called_once()
+    mock_exec.execute_candidates.assert_called_once()
+
+    checkpoints = repo.get_checkpoints(run_id)
+    assert [cp.step_index for cp in checkpoints] == [2, 3, 4, 5, 7]
+
+
+def test_recovery_from_checkpoint_3_generation(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies resumption from step 3 executes validate_candidates_node next and does not re-generate."""
+    run_id = "run-cp3"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
+    cand_raw = _make_candidate(run_id=run_id, status=ValidationStatus.PENDING)
+    cand_val = _make_candidate(run_id=run_id, status=ValidationStatus.PASSED)
+    state_3 = _make_state(run_id=run_id, snapshot=snapshot, plan=plan, candidates=(cand_raw,))
+    ev = _make_evidence(run_id=run_id, exit_code=0)
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_3.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=state_3, step_index=3, node_name="generate_tests_node")
+
+    mock_gen = MagicMock()
+    mock_val = MagicMock(validate_candidates=MagicMock(return_value=[(cand_val, MagicMock(passed=True))]))
+    mock_exec = MagicMock(execute_candidates=MagicMock(return_value=(ev,)))
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        generation_service=mock_gen,
+        validation_pipeline=mock_val,
+        execution_service=mock_exec,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    mock_gen.generate.assert_not_called()  # Generation NOT repeated
+    mock_val.validate_candidates.assert_called_once()
+    mock_exec.execute_candidates.assert_called_once()
+
+    checkpoints = repo.get_checkpoints(run_id)
+    assert [cp.step_index for cp in checkpoints] == [3, 4, 5, 7]
+
+
+def test_recovery_from_checkpoint_4_validation(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies resumption from step 4 routes to execute_sandbox_node without re-validating."""
+    run_id = "run-cp4"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
+    cand_val = _make_candidate(run_id=run_id, status=ValidationStatus.PASSED)
+    state_4 = _make_state(run_id=run_id, snapshot=snapshot, plan=plan, candidates=(cand_val,))
+    ev = _make_evidence(run_id=run_id, exit_code=0)
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_4.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=state_4, step_index=4, node_name="validate_candidates_node")
+
+    mock_val = MagicMock()
+    mock_exec = MagicMock(execute_candidates=MagicMock(return_value=(ev,)))
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        validation_pipeline=mock_val,
+        execution_service=mock_exec,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    mock_val.validate_candidates.assert_not_called()  # Validation NOT repeated
+    mock_exec.execute_candidates.assert_called_once()
+
+    checkpoints = repo.get_checkpoints(run_id)
+    assert [cp.step_index for cp in checkpoints] == [4, 5, 7]
+
+
+def test_recovery_from_checkpoint_5_execution_routes_to_diagnosis(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies resumption from step 5 routes failed evidences to diagnose_failure_node without re-executing."""
+    run_id = "run-cp5"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
+    cand = _make_candidate(run_id=run_id, status=ValidationStatus.PASSED)
+    ev_fail = _make_evidence(run_id=run_id, candidate_id=cand.candidate_id, exit_code=1)
+    diag = _make_diagnosis(evidence_id=ev_fail.evidence_id)
+
+    state_5 = _make_state(
+        run_id=run_id,
+        snapshot=snapshot,
+        plan=plan,
+        candidates=(cand,),
+        evidences=(ev_fail,),
+    )
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_5.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_candidate(cand)
+    repo.save_evidence(ev_fail)
+    repo.save_checkpoint(state=state_5, step_index=5, node_name="execute_sandbox_node")
+
+    mock_exec = MagicMock()
+    mock_diag = MagicMock(diagnose=MagicMock(return_value=diag))
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        execution_service=mock_exec,
+        diagnosis_service=mock_diag,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    mock_exec.execute_candidates.assert_not_called()  # Execution NOT repeated
+    mock_diag.diagnose.assert_called_once()           # Diagnosis executed
+
+    checkpoints = repo.get_checkpoints(run_id)
+    assert [cp.step_index for cp in checkpoints] == [5, 6, 7]
+
+
+def test_recovery_from_checkpoint_6_diagnosis(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies resumption from step 6 dispatches report_node next without repeating diagnosis."""
+    run_id = "run-cp6"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
+    cand = _make_candidate(run_id=run_id, status=ValidationStatus.PASSED)
+    ev_fail = _make_evidence(run_id=run_id, candidate_id=cand.candidate_id, exit_code=1)
+    diag = _make_diagnosis(evidence_id=ev_fail.evidence_id)
+
+    state_6 = _make_state(
+        run_id=run_id,
+        snapshot=snapshot,
+        plan=plan,
+        candidates=(cand,),
+        evidences=(ev_fail,),
+        diagnoses=(diag,),
+    )
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_6.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_candidate(cand)
+    repo.save_evidence(ev_fail)
+    repo.save_diagnosis(diag, run_id=run_id)
+    repo.save_checkpoint(state=state_6, step_index=6, node_name="diagnose_failure_node")
+
+    mock_diag = MagicMock()
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        diagnosis_service=mock_diag,
+    )
+
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    mock_diag.diagnose.assert_not_called()  # Diagnosis NOT repeated
+
+    checkpoints = repo.get_checkpoints(run_id)
+    assert [cp.step_index for cp in checkpoints] == [6, 7]
+
+
+def test_recovery_failure_updates_run_to_failed_and_emits_event(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that an exception during resumption sets final_status=FAILED and emits RUN_FAILED."""
+    run_id = "run-resume-err"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
+    state_2 = _make_state(run_id=run_id, snapshot=snapshot, plan=plan)
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state_2.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=state_2, step_index=2, node_name="plan_execution_node")
+
+    mock_gen = MagicMock(generate=MagicMock(side_effect=RuntimeError("LLM generation crashed")))
+
+    engine = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        generation_service=mock_gen,
+    )
+
+    with pytest.raises(RuntimeError, match="LLM generation crashed"):
+        resume_run(run_id, engine)
+
+    # RunRecord updated to FAILED with error message
+    run_rec = repo.get_run(run_id)
+    assert run_rec is not None
+    assert run_rec.final_status == "FAILED"
+    assert "LLM generation crashed" in (run_rec.error_message or "")
+
+    # RUN_FAILED event emitted
+    events = event_store.get_events(run_id)
+    fail_events = [e for e in events if e.event_type == "RUN_FAILED"]
+    assert len(fail_events) == 1
+    assert fail_events[0].node_name == "generate_tests_node"
+    assert "LLM generation crashed" in fail_events[0].payload["error"]
+
+
+def test_recovery_state_roundtrip_fidelity(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that all entities and state collections survive checkpoint round-trip during recovery."""
+    run_id = "run-roundtrip"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
+    cand = _make_candidate(run_id=run_id, candidate_id="c_rt", status=ValidationStatus.PASSED)
+    base_ev = _make_evidence(run_id=run_id, evidence_id="ev_base", candidate_id=None, exit_code=0)
+    cand_ev = _make_evidence(run_id=run_id, evidence_id="ev_cand", candidate_id="c_rt", exit_code=1)
+    diag = _make_diagnosis(diagnosis_id="d_rt", evidence_id="ev_cand")
+
+    state = _make_state(
+        run_id=run_id,
+        snapshot=snapshot,
+        plan=plan,
+        candidates=(cand,),
+        baseline_evidence=base_ev,
+        evidences=(cand_ev,),
+        diagnoses=(diag,),
+    )
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=state.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_candidate(cand)
+    repo.save_evidence(base_ev)
+    repo.save_evidence(cand_ev)
+    repo.save_diagnosis(diag, run_id=run_id)
+    repo.save_checkpoint(state=state, step_index=6, node_name="diagnose_failure_node")
+
+    engine = WorkflowEngine(repository=repo, event_store=event_store)
+    final_state = resume_run(run_id, engine)
+
+    assert final_state.final_status == "COMPLETED"
+    assert final_state.snapshot == snapshot
+    assert final_state.plan == plan
+    assert final_state.candidates == (cand,)
+    assert final_state.baseline_evidence == base_ev
+    assert final_state.evidences == (cand_ev,)
+    assert final_state.diagnoses == (diag,)
+
+
+def test_recovery_no_duplicate_checkpoints_or_artifacts(
+    repo: SQLiteRepository, event_store: SQLiteEventStore
+) -> None:
+    """Verifies that resumption preserves existing checkpoints and creates no duplicate step entries."""
+    run_id = "run-no-dupes"
+    snapshot = _make_snapshot()
+    plan = _make_plan(route=WorkflowRoute.ROUTE_NO_OP)
+
+    # Initial partial run
+    mock_analysis = MagicMock(analyze=MagicMock(return_value=snapshot))
+    mock_planner = MagicMock(plan=MagicMock(return_value=plan))
+    engine_init = WorkflowEngine(
+        repository=repo,
+        event_store=event_store,
+        analysis_service=mock_analysis,
+        planner=mock_planner,
+    )
+
+    # Simulate crash right after step 2 checkpoint
+    init_state = _make_state(run_id=run_id)
+    repo.save_run(
+        run_id=run_id,
+        repo_path=init_state.repo_path,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    repo.save_checkpoint(state=init_state, step_index=0, node_name="initialized")
+    state_1 = init_state.model_copy(update={"snapshot": snapshot})
+    repo.save_checkpoint(state=state_1, step_index=1, node_name="ingest_and_analyze_node")
+    state_2 = state_1.model_copy(update={"plan": plan})
+    repo.save_checkpoint(state=state_2, step_index=2, node_name="plan_execution_node")
+
+    # Resume from checkpoint 2 to completion
+    final_state = resume_run(run_id, engine_init)
+    assert final_state.final_status == "COMPLETED"
+
+    # Verify checkpoints: exactly 0, 1, 2, 7 (no duplicates)
+    checkpoints = repo.get_checkpoints(run_id)
+    step_indices = [cp.step_index for cp in checkpoints]
+    assert step_indices == [0, 1, 2, 7]
+    assert len(step_indices) == len(set(step_indices))

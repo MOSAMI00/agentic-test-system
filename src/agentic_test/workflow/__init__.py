@@ -19,9 +19,18 @@ from agentic_test.workflow.nodes import (
     validate_candidates_node,
 )
 
+from agentic_test.workflow.recovery import (
+    RecoveryError,
+    WorkflowRecoveryService,
+    resume_run,
+)
+
 __all__ = [
     "WorkflowEngine",
     "NODE_STEP_INDICES",
+    "RecoveryError",
+    "WorkflowRecoveryService",
+    "resume_run",
     "ingest_and_analyze_node",
     "plan_execution_node",
     "generate_tests_node",
