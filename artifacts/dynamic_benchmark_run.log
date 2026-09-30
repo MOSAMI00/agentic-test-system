@@ -1,0 +1,142 @@
+================================================================================
+AGENTIC TEST GENERATION AND MAINTENANCE SYSTEM - DYNAMIC BENCHMARK LOG
+Milestone M1.6 End-to-End Dynamic Offline Benchmark Verification
+================================================================================
+
+1. EXECUTION METADATA
+--------------------------------------------------------------------------------
+Command Line:       agentic-test run --repo <sanitized_repo_path> --db <sanitized_db_path> --offline
+Repository Path:    <sanitized_repo_path>
+Baseline Commit:    f5ecea390a41c3d93a9aedb24bcaab69a9f0274e
+Database Path:      <sanitized_db_path>
+Execution Mode:     OFFLINE (Hermetic, Mock Adapters, Static Validation)
+Route Selected:     ROUTE_TO_TEST_GENERATION
+Final Run Status:   COMPLETED
+
+2. SAFETY AND HERMETICITY GUARANTEES
+--------------------------------------------------------------------------------
+[VERIFIED] Pure hermetic offline execution mode active (--offline).
+[VERIFIED] Wired through production service factory seam: default_create_workflow_engine(..., offline=True).
+[VERIFIED] Injected MockLLMService and MockSandboxManager.
+[VERIFIED] Static validation gates active (Gate 1 SyntaxValidator, Gate 2 SecurityValidator).
+[VERIFIED] Zero external network requests made (Gemini, OpenAI, LiteLLM disabled).
+[VERIFIED] Zero Docker daemon interaction.
+[VERIFIED] Zero candidate execution on host machine.
+[VERIFIED] All container commands and synthesized candidate executions confined to in-memory mock doubles.
+
+3. CAPTURED CONSOLE OUTPUT (RICH TERMINAL PRESENTATION)
+--------------------------------------------------------------------------------
+┌────────────── Agentic Test Generation and Maintenance System ───────────────┐
+│                                                                             │
+│  Run ID:          run-b25871d35a36                                          │
+│  Repository:      <repo_path>                                               │
+│  Database:        <db_path>                                                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                 Execution Summary                 
+┌──────────────────────┬──────────────────────────┐
+│ Property             │ Value                    │
+├──────────────────────┼──────────────────────────┤
+│ Final Status         │ COMPLETED                │
+│ Selected Route       │ ROUTE_TO_TEST_GENERATION │
+│ Target Symbols       │ 1                        │
+│ Generated Candidates │ 1                        │
+│ Execution Evidences  │ 1                        │
+│ Failure Diagnoses    │ 1                        │
+└──────────────────────┴──────────────────────────┘
+                      Test Candidates & Validation Status                      
+┌──────────────┬───────────────────┬───────────────────┬───────────┬──────────┐
+│ Candidate ID │ Target Symbol     │ Validation Status │ Exit Code │ Duration │
+├──────────────┼───────────────────┼───────────────────┼───────────┼──────────┤
+│ tc-d9155655  │ calculator.multi… │ PASSED            │         1 │    0.15s │
+└──────────────┴───────────────────┴───────────────────┴───────────┴──────────┘
+                    Coverage Telemetry & Deltas                     
+┌──────────────┬──────────┬────────────┬────────────┬──────────────┐
+│ Candidate ID │ Line Cov │ Line Delta │ Branch Cov │ Branch Delta │
+├──────────────┼──────────┼────────────┼────────────┼──────────────┤
+│ tc-d9155655  │    85.0% │          - │       0.0% │            - │
+└──────────────┴──────────┴────────────┴────────────┴──────────────┘
+                          Failure Diagnoses & Triage                           
+┌──────────────┬─────────────┬──────────┬──────────────┬────────────┬─────────┐
+│ Diagnosis ID │ Evidence ID │ Category │ Engine       │ Confidence │ Is Bug? │
+├──────────────┼─────────────┼──────────┼──────────────┼────────────┼─────────┤
+│ 1b424652-a1… │ ev-6bcf3c9… │ UNKNOWN  │ COGNITIVE_L… │       0.75 │   no    │
+└──────────────┴─────────────┴──────────┴──────────────┴────────────┴─────────┘
+--------------------------------------------------------------------------------
+
+4. SQLITE SCHEMA VERIFICATION (ALL 6 REQUIRED TABLES)
+--------------------------------------------------------------------------------
+Table Name                Status         
+--------------------------------------------------------------------------------
+checkpoints               PRESENT [Verified]
+events                    PRESENT [Verified]
+execution_evidence        PRESENT [Verified]
+failure_diagnoses         PRESENT [Verified]
+runs                      PRESENT [Verified]
+test_candidates           PRESENT [Verified]
+
+5. SQLITE TABLE ROW COUNTS (ALL TABLES POPULATED)
+--------------------------------------------------------------------------------
+Table Name                Row Count    Expected                      
+--------------------------------------------------------------------------------
+checkpoints               8            8 (Steps 0, 1, 2, 3, 4, 5, 6, 7)
+events                    15           15 (CONFIG_MODE + 7 node pairs)
+execution_evidence        1            1 (Mock execution evidence)   
+failure_diagnoses         1            1 (Intentional failure diagnosis)
+runs                      1            1 (Matching executed run)     
+test_candidates           1            1 (Synthesized candidate)     
+
+6. PERSISTED TEST CANDIDATES
+--------------------------------------------------------------------------------
+Candidate ID           Target Symbol             Validation Status   
+--------------------------------------------------------------------------------
+tc-d9155655            calculator.multiply       PASSED              
+
+7. PERSISTED EXECUTION EVIDENCE
+--------------------------------------------------------------------------------
+Evidence ID            Exit Code    Line Coverage      Duration (s)   
+--------------------------------------------------------------------------------
+ev-6bcf3c93e767        1            85.0%              0.15           
+
+8. PERSISTED FAILURE DIAGNOSES
+--------------------------------------------------------------------------------
+Diagnosis ID                           Evidence ID            Canonical Category       
+--------------------------------------------------------------------------------
+1b424652-a1ce-4ed4-89d6-3f46cf3291ee   ev-6bcf3c93e767        UNKNOWN                  
+
+9. VERIFIED CHECKPOINT SEQUENCE
+--------------------------------------------------------------------------------
+Step Index   Node Name                      Status         
+--------------------------------------------------------------------------------
+0            initialized                    COMPLETED      
+1            ingest_and_analyze_node        COMPLETED      
+2            plan_execution_node            COMPLETED      
+3            generate_tests_node            COMPLETED      
+4            validate_candidates_node       COMPLETED      
+5            execute_sandbox_node           COMPLETED      
+6            diagnose_failure_node          COMPLETED      
+7            report_node                    COMPLETED      
+
+10. VERIFIED EVENT SEQUENCE
+--------------------------------------------------------------------------------
+Seq    Event Type           Payload Summary                                   
+--------------------------------------------------------------------------------
+1      CONFIG_MODE          {'offline': True}                                 
+2      NODE_STARTED         {'step_index': 1}                                 
+3      NODE_COMPLETED       {'step_index': 1}                                 
+4      NODE_STARTED         {'step_index': 2}                                 
+5      NODE_COMPLETED       {'step_index': 2}                                 
+6      NODE_STARTED         {'step_index': 3}                                 
+7      NODE_COMPLETED       {'step_index': 3}                                 
+8      NODE_STARTED         {'step_index': 4}                                 
+9      NODE_COMPLETED       {'step_index': 4}                                 
+10     NODE_STARTED         {'step_index': 5}                                 
+11     NODE_COMPLETED       {'step_index': 5}                                 
+12     NODE_STARTED         {'step_index': 6}                                 
+13     NODE_COMPLETED       {'step_index': 6}                                 
+14     NODE_STARTED         {'step_index': 7}                                 
+15     NODE_COMPLETED       {'step_index': 7}                                 
+
+================================================================================
+END OF DYNAMIC BENCHMARK LOG
+================================================================================
