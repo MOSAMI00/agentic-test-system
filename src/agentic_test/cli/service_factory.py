@@ -132,19 +132,57 @@ def default_create_workflow_engine(
 
         # In live mode, verify required live adapters or fail closed
         if generation_service is None:
-            has_api_key = (
-                (settings.openai_api_key is not None and bool(settings.openai_api_key.get_secret_value()))
-                or bool(os.environ.get("OPENAI_API_KEY"))
+            openai_key = (
+                settings.openai_api_key.get_secret_value()
+                if settings.openai_api_key is not None
+                else os.environ.get("OPENAI_API_KEY")
             )
+            gemini_key = (
+                settings.gemini_api_key.get_secret_value()
+                if settings.gemini_api_key is not None
+                else os.environ.get("GEMINI_API_KEY")
+            )
+            anthropic_key = (
+                settings.anthropic_api_key.get_secret_value()
+                if settings.anthropic_api_key is not None
+                else os.environ.get("ANTHROPIC_API_KEY")
+            )
+
+            configured_model = (
+                settings.llm_model
+                or os.environ.get("AGENTIC_TEST_LLM_MODEL")
+                or os.environ.get("LLM_MODEL")
+            )
+
+            if not configured_model:
+                if gemini_key and not openai_key:
+                    configured_model = "gemini/gemini-1.5-flash"
+                elif anthropic_key and not openai_key:
+                    configured_model = "claude-3-5-sonnet-20241022"
+                else:
+                    configured_model = "gpt-4o-mini"
+
+            m = configured_model.lower()
+            if m.startswith("gemini/") or "gemini" in m:
+                has_api_key = bool(gemini_key)
+                selected_key = gemini_key
+            elif m.startswith("anthropic/") or "claude" in m:
+                has_api_key = bool(anthropic_key)
+                selected_key = anthropic_key
+            else:
+                has_api_key = bool(openai_key)
+                selected_key = openai_key
+
             if not has_api_key:
                 raise ConfigurationError(
-                    "Live LLM service unavailable: 'OPENAI_API_KEY' is not configured. "
-                    "Configure OPENAI_API_KEY or run with --offline for local deterministic execution."
+                    f"Live LLM service unavailable: API key not configured for model '{configured_model}'. "
+                    "Configure GEMINI_API_KEY, OPENAI_API_KEY, or run with --offline for local deterministic execution."
                 )
             from agentic_test.generation.litellm_service import LiteLLMService
 
             live_llm = LiteLLMService(
-                api_key=settings.openai_api_key or os.environ.get("OPENAI_API_KEY"),
+                model=configured_model,
+                api_key=selected_key,
                 allow_external_transmission=True,
             )
             generation_service = GenerationService(

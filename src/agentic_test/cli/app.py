@@ -58,8 +58,12 @@ def validate_repo_path(repo_path: Path) -> Path:
     return repo_path.resolve()
 
 
-def _execute_new_run(repo_path: Path, db_path: Path, offline: bool = False) -> None:
+def _execute_new_run(repo_path: Path, db_path: Path, offline: bool = False, model: Optional[str] = None) -> None:
     """Executes a new end-to-end test generation run."""
+    import os
+    if model:
+        os.environ["AGENTIC_TEST_LLM_MODEL"] = model
+
     resolved_repo = validate_repo_path(repo_path)
     run_id = f"run-{uuid.uuid4().hex[:12]}"
 
@@ -202,12 +206,18 @@ def run_command(
         "--offline",
         help="Execute in hermetic offline mode using mock sandbox and LLM adapters (no Docker or external APIs).",
     ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help="Cognitive LLM model identifier (e.g. 'gemini/gemini-1.5-flash', 'gpt-4o-mini').",
+    ),
 ) -> None:
     """Executes a new pipeline run or resumes an interrupted run."""
     if resume is not None:
         _execute_resume(run_id=resume, db_path=db, offline=offline)
     elif repo is not None:
-        _execute_new_run(repo_path=repo, db_path=db, offline=offline)
+        _execute_new_run(repo_path=repo, db_path=db, offline=offline, model=model)
     else:
         print_error("Missing required parameter: Either --repo <path> or --resume <run_id> must be specified.")
         raise typer.Exit(code=2)

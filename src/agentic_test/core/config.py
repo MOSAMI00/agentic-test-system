@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     cpu_quota: float = 1.0
     pids_limit: int = 100
     openai_api_key: Optional[SecretStr] = None
+    gemini_api_key: Optional[SecretStr] = None
+    anthropic_api_key: Optional[SecretStr] = None
+    llm_model: Optional[str] = None
 
 
 settings = Settings()
