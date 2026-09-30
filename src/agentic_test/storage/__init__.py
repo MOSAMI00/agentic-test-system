@@ -12,11 +12,19 @@ from agentic_test.storage.events import (
     EventRecord,
     SQLiteEventStore,
 )
+from agentic_test.storage.repository import (
+    CheckpointRecord,
+    RunRecord,
+    SQLiteRepository,
+)
 
 __all__ = [
+    "CheckpointRecord",
     "EventRecord",
+    "RunRecord",
     "SCHEMA_DDL",
     "SQLiteEventStore",
+    "SQLiteRepository",
     "get_connection",
     "init_database",
     "init_db",

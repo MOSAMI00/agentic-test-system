@@ -12,6 +12,16 @@ from typing import Any, Dict, List, Set
 from pydantic import ValidationError
 import pytest
 
+from agentic_test.core.models import (
+    ExecutionEvidence,
+    FailureCategory,
+    FailureDiagnosis,
+    TestCandidate,
+    TriageEngine,
+    ValidationStatus,
+    WorkflowRoute,
+)
+from agentic_test.core.state import WorkflowState
 from agentic_test.storage.database import (
     SCHEMA_DDL,
     get_connection,
@@ -21,6 +31,11 @@ from agentic_test.storage.database import (
 from agentic_test.storage.events import (
     EventRecord,
     SQLiteEventStore,
+)
+from agentic_test.storage.repository import (
+    CheckpointRecord,
+    RunRecord,
+    SQLiteRepository,
 )
 
 
@@ -973,3 +988,691 @@ def test_event_store_instantiation_with_path_and_connection(tmp_path: Path) -> N
         assert events[0].payload == {"on_disk": True}
     finally:
         store.connection.close()
+
+
+# ============================================================================
+# 9. Relational Repository & State Checkpointing Tests (Slice 1.6.2C)
+# ============================================================================
+
+def test_run_persistence_and_retrieval() -> None:
+    """Verifies saving, retrieving, and updating pipeline execution runs."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        now = datetime.now(timezone.utc)
+
+        run = RunRecord(
+            run_id="run-100",
+            repo_path=Path("/workspace/repo"),
+            current_commit="a" * 40,
+            base_commit="b" * 40,
+            branch_name="feature-branch",
+            route_selected=WorkflowRoute.ROUTE_TO_TEST_GENERATION.value,
+            started_at=now,
+            final_status="RUNNING",
+        )
+
+        saved = repo.save_run(run)
+        assert saved.run_id == "run-100"
+
+        # Retrieve run
+        retrieved = repo.get_run("run-100")
+        assert retrieved is not None
+        assert retrieved.run_id == "run-100"
+        assert retrieved.repo_path == Path("/workspace/repo")
+        assert retrieved.current_commit == "a" * 40
+        assert retrieved.base_commit == "b" * 40
+        assert retrieved.branch_name == "feature-branch"
+        assert retrieved.route_selected == WorkflowRoute.ROUTE_TO_TEST_GENERATION.value
+        assert retrieved.started_at == now
+        assert retrieved.completed_at is None
+        assert retrieved.final_status == "RUNNING"
+        assert retrieved.error_message is None
+
+        # Update run status and completion
+        completed_time = datetime.now(timezone.utc)
+        updated_run = RunRecord(
+            run_id="run-100",
+            repo_path=Path("/workspace/repo"),
+            current_commit="a" * 40,
+            base_commit="b" * 40,
+            branch_name="feature-branch",
+            route_selected=WorkflowRoute.ROUTE_TO_TEST_GENERATION.value,
+            started_at=now,
+            completed_at=completed_time,
+            final_status="COMPLETED",
+            error_message=None,
+        )
+        repo.save_run(updated_run)
+
+        retrieved_updated = repo.get_run("run-100")
+        assert retrieved_updated is not None
+        assert retrieved_updated.final_status == "COMPLETED"
+        assert retrieved_updated.completed_at == completed_time
+
+        # Test saving with keyword arguments
+        repo.save_run(
+            run_id="run-200",
+            repo_path="/other/repo",
+            current_commit="c" * 40,
+            base_commit="d" * 40,
+            branch_name="main",
+            route_selected=WorkflowRoute.ROUTE_NO_OP,
+            final_status="NO_OP",
+        )
+        r2 = repo.get_run("run-200")
+        assert r2 is not None
+        assert r2.run_id == "run-200"
+        assert r2.route_selected == WorkflowRoute.ROUTE_NO_OP.value
+    finally:
+        conn.close()
+
+
+def test_candidate_persistence_and_retrieval() -> None:
+    """Verifies saving, retrieving, and updating test candidates."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(
+            run_id="run-1",
+            repo_path="/repo",
+            current_commit="c1",
+            base_commit="b1",
+            branch_name="main",
+        )
+
+        now = datetime.now(timezone.utc)
+        candidate = TestCandidate(
+            candidate_id="cand-1",
+            run_id="run-1",
+            target_symbol_name="calc_sum",
+            test_file_path=Path("tests/test_calc.py"),
+            candidate_code="def test_calc(): assert calc_sum(1, 2) == 3",
+            validation_status=ValidationStatus.PASSED,
+            retry_count=0,
+            created_at=now,
+        )
+
+        saved = repo.save_candidate(candidate)
+        assert saved.candidate_id == "cand-1"
+
+        # Retrieve single candidate
+        retrieved = repo.get_candidate("cand-1")
+        assert retrieved is not None
+        assert retrieved.candidate_id == "cand-1"
+        assert retrieved.run_id == "run-1"
+        assert retrieved.target_symbol_name == "calc_sum"
+        assert retrieved.test_file_path == Path("tests/test_calc.py")
+        assert retrieved.candidate_code == "def test_calc(): assert calc_sum(1, 2) == 3"
+        assert retrieved.validation_status == ValidationStatus.PASSED
+        assert retrieved.quarantine_reason is None
+        assert retrieved.retry_count == 0
+        assert retrieved.created_at == now
+
+        # Retrieve list of candidates for run
+        cand_list = repo.get_candidates("run-1")
+        assert len(cand_list) == 1
+        assert cand_list[0].candidate_id == "cand-1"
+
+        # Update candidate status to QUARANTINED
+        quarantined_cand = TestCandidate(
+            candidate_id="cand-1",
+            run_id="run-1",
+            target_symbol_name="calc_sum",
+            test_file_path=Path("tests/test_calc.py"),
+            candidate_code="def test_calc(): assert calc_sum(1, 2) == 3",
+            validation_status=ValidationStatus.QUARANTINED,
+            quarantine_reason="Security AST failure",
+            retry_count=1,
+            created_at=now,
+        )
+        repo.save_candidate(quarantined_cand)
+
+        retrieved_q = repo.get_candidate("cand-1")
+        assert retrieved_q is not None
+        assert retrieved_q.validation_status == ValidationStatus.QUARANTINED
+        assert retrieved_q.quarantine_reason == "Security AST failure"
+        assert retrieved_q.retry_count == 1
+    finally:
+        conn.close()
+
+
+def test_evidence_persistence_and_retrieval() -> None:
+    """Verifies saving and retrieving candidate execution evidence with coverage deltas."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(
+            run_id="run-1",
+            repo_path="/repo",
+            current_commit="c1",
+            base_commit="b1",
+            branch_name="main",
+        )
+        repo.save_candidate(
+            TestCandidate(
+                candidate_id="cand-1",
+                run_id="run-1",
+                target_symbol_name="compute",
+                test_file_path=Path("test.py"),
+                candidate_code="code",
+            )
+        )
+
+        now = datetime.now(timezone.utc)
+        evidence = ExecutionEvidence(
+            evidence_id="ev-100",
+            run_id="run-1",
+            candidate_id="cand-1",
+            exit_code=1,
+            stdout="collected 1 item\nFAILED test.py",
+            stderr="AssertionError",
+            duration_sec=1.23,
+            timed_out=False,
+            line_coverage=85.5,
+            branch_coverage=75.0,
+            line_coverage_delta=5.5,
+            branch_coverage_delta=3.0,
+            traceback="Traceback:\n  assert False",
+            created_at=now,
+        )
+
+        repo.save_evidence(evidence)
+
+        # Retrieve by evidence_id
+        retrieved = repo.get_evidence("ev-100")
+        assert retrieved is not None
+        assert retrieved.evidence_id == "ev-100"
+        assert retrieved.run_id == "run-1"
+        assert retrieved.candidate_id == "cand-1"
+        assert retrieved.exit_code == 1
+        assert retrieved.stdout == "collected 1 item\nFAILED test.py"
+        assert retrieved.stderr == "AssertionError"
+        assert retrieved.duration_sec == 1.23
+        assert retrieved.timed_out is False
+        assert retrieved.line_coverage == 85.5
+        assert retrieved.branch_coverage == 75.0
+        assert retrieved.line_coverage_delta == 5.5
+        assert retrieved.branch_coverage_delta == 3.0
+        assert retrieved.traceback == "Traceback:\n  assert False"
+        assert retrieved.created_at == now
+
+        # Retrieve for run
+        ev_list = repo.get_run_evidence("run-1")
+        assert len(ev_list) == 1
+        assert ev_list[0].evidence_id == "ev-100"
+    finally:
+        conn.close()
+
+
+def test_baseline_evidence_persistence_and_retrieval() -> None:
+    """Verifies baseline evidence with candidate_id=None."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(
+            run_id="run-1",
+            repo_path="/repo",
+            current_commit="c1",
+            base_commit="b1",
+            branch_name="main",
+        )
+
+        now = datetime.now(timezone.utc)
+        baseline = ExecutionEvidence(
+            evidence_id="ev-baseline",
+            run_id="run-1",
+            candidate_id=None,
+            exit_code=0,
+            stdout="all existing tests passed",
+            stderr="",
+            duration_sec=3.45,
+            timed_out=False,
+            line_coverage=80.0,
+            branch_coverage=72.0,
+            line_coverage_delta=None,
+            branch_coverage_delta=None,
+            traceback=None,
+            created_at=now,
+        )
+
+        repo.save_evidence(baseline)
+
+        retrieved = repo.get_evidence("ev-baseline")
+        assert retrieved is not None
+        assert retrieved.candidate_id is None
+        assert retrieved.line_coverage_delta is None
+        assert retrieved.branch_coverage_delta is None
+
+        # Filter baseline only
+        baseline_list = repo.get_run_evidence("run-1", baseline_only=True)
+        assert len(baseline_list) == 1
+        assert baseline_list[0].evidence_id == "ev-baseline"
+    finally:
+        conn.close()
+
+
+def test_diagnosis_persistence_and_retrieval() -> None:
+    """Verifies saving and retrieving failure diagnoses with enum round trips."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(
+            run_id="run-1",
+            repo_path="/repo",
+            current_commit="c1",
+            base_commit="b1",
+            branch_name="main",
+        )
+        repo.save_evidence(
+            ExecutionEvidence(
+                evidence_id="ev-1",
+                run_id="run-1",
+                candidate_id=None,
+                exit_code=1,
+                stdout="",
+                stderr="error",
+                duration_sec=0.5,
+            )
+        )
+
+        now = datetime.now(timezone.utc)
+        diag = FailureDiagnosis(
+            diagnosis_id="diag-1",
+            evidence_id="ev-1",
+            canonical_category=FailureCategory.APPLICATION_BUG,
+            confidence=0.98,
+            triage_engine=TriageEngine.COGNITIVE_LLM,
+            explanation="Assertion indicates regression in production source",
+            is_application_bug=True,
+            created_at=now,
+        )
+
+        repo.save_diagnosis(diag)
+
+        # Retrieve by ID
+        retrieved = repo.get_diagnosis("diag-1")
+        assert retrieved is not None
+        assert retrieved.diagnosis_id == "diag-1"
+        assert retrieved.evidence_id == "ev-1"
+        assert retrieved.canonical_category == FailureCategory.APPLICATION_BUG
+        assert retrieved.confidence == 0.98
+        assert retrieved.triage_engine == TriageEngine.COGNITIVE_LLM
+        assert retrieved.explanation == "Assertion indicates regression in production source"
+        assert retrieved.is_application_bug is True
+        assert retrieved.created_at == now
+
+        # Retrieve list for run
+        diag_list = repo.get_diagnoses("run-1")
+        assert len(diag_list) == 1
+        assert diag_list[0].diagnosis_id == "diag-1"
+    finally:
+        conn.close()
+
+
+def test_candidate_evidence_diagnosis_linkage() -> None:
+    """Verifies complete entity chain linkage from run through candidate, evidence, and diagnosis."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(
+            run_id="run-1",
+            repo_path="/repo",
+            current_commit="c1",
+            base_commit="b1",
+            branch_name="main",
+        )
+
+        candidate = repo.save_candidate(
+            TestCandidate(
+                candidate_id="cand-chain",
+                run_id="run-1",
+                target_symbol_name="symbol",
+                test_file_path=Path("test.py"),
+                candidate_code="def test(): pass",
+            )
+        )
+
+        evidence = repo.save_evidence(
+            ExecutionEvidence(
+                evidence_id="ev-chain",
+                run_id="run-1",
+                candidate_id=candidate.candidate_id,
+                exit_code=1,
+                stdout="",
+                stderr="NameError",
+                duration_sec=0.2,
+            )
+        )
+
+        diagnosis = repo.save_diagnosis(
+            FailureDiagnosis(
+                diagnosis_id="diag-chain",
+                evidence_id=evidence.evidence_id,
+                canonical_category=FailureCategory.INVALID_GENERATED_TEST,
+                confidence=1.0,
+                triage_engine=TriageEngine.DETERMINISTIC_RULE,
+                explanation="Generated test references undefined symbol",
+                is_application_bug=False,
+            )
+        )
+
+        assert diagnosis.evidence_id == evidence.evidence_id
+        assert evidence.candidate_id == candidate.candidate_id
+    finally:
+        conn.close()
+
+
+def test_cross_run_evidence_rejection() -> None:
+    """Verifies that save_evidence rejects candidate belonging to another run."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(run_id="run-A", repo_path="/repoA", current_commit="cA", base_commit="bA", branch_name="main")
+        repo.save_run(run_id="run-B", repo_path="/repoB", current_commit="cB", base_commit="bB", branch_name="main")
+
+        repo.save_candidate(
+            TestCandidate(
+                candidate_id="cand-A",
+                run_id="run-A",
+                target_symbol_name="sym",
+                test_file_path=Path("test.py"),
+                candidate_code="code",
+            )
+        )
+
+        # Attempt to save evidence in run-B linking to cand-A
+        with pytest.raises((ValueError, sqlite3.IntegrityError)):
+            repo.save_evidence(
+                ExecutionEvidence(
+                    evidence_id="ev-cross",
+                    run_id="run-B",
+                    candidate_id="cand-A",
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                    duration_sec=1.0,
+                )
+            )
+    finally:
+        conn.close()
+
+
+def test_cross_run_diagnosis_rejection() -> None:
+    """Verifies that save_diagnosis rejects evidence belonging to another run."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(run_id="run-A", repo_path="/repoA", current_commit="cA", base_commit="bA", branch_name="main")
+        repo.save_run(run_id="run-B", repo_path="/repoB", current_commit="cB", base_commit="bB", branch_name="main")
+
+        repo.save_evidence(
+            ExecutionEvidence(
+                evidence_id="ev-A",
+                run_id="run-A",
+                candidate_id=None,
+                exit_code=1,
+                stdout="",
+                stderr="err",
+                duration_sec=1.0,
+            )
+        )
+
+        # Attempt to save diagnosis with mismatched run_id
+        with pytest.raises((ValueError, sqlite3.IntegrityError)):
+            repo.save_diagnosis(
+                FailureDiagnosis(
+                    diagnosis_id="diag-cross",
+                    evidence_id="ev-A",
+                    canonical_category=FailureCategory.ENVIRONMENT_FAILURE,
+                    confidence=1.0,
+                    triage_engine=TriageEngine.DETERMINISTIC_RULE,
+                    explanation="Timeout",
+                ),
+                run_id="run-B",
+            )
+    finally:
+        conn.close()
+
+
+def test_workflow_state_checkpoint_roundtrip() -> None:
+    """Verifies that WorkflowState checkpoints serialize and deserialize with complete fidelity."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(
+            run_id="run-state-1",
+            repo_path="/repo",
+            current_commit="c1",
+            base_commit="b1",
+            branch_name="main",
+        )
+
+        now = datetime.now(timezone.utc)
+        cand = TestCandidate(
+            candidate_id="c1",
+            run_id="run-state-1",
+            target_symbol_name="compute",
+            test_file_path=Path("test.py"),
+            candidate_code="code",
+            created_at=now,
+        )
+        base_ev = ExecutionEvidence(
+            evidence_id="ev-base",
+            run_id="run-state-1",
+            candidate_id=None,
+            exit_code=0,
+            stdout="base pass",
+            stderr="",
+            duration_sec=1.0,
+            created_at=now,
+        )
+        cand_ev = ExecutionEvidence(
+            evidence_id="ev-cand",
+            run_id="run-state-1",
+            candidate_id="c1",
+            exit_code=1,
+            stdout="cand fail",
+            stderr="assert error",
+            duration_sec=0.8,
+            created_at=now,
+        )
+        diag = FailureDiagnosis(
+            diagnosis_id="d1",
+            evidence_id="ev-cand",
+            canonical_category=FailureCategory.APPLICATION_BUG,
+            confidence=0.95,
+            triage_engine=TriageEngine.COGNITIVE_LLM,
+            explanation="App bug",
+            is_application_bug=True,
+            created_at=now,
+        )
+
+        state = WorkflowState(
+            run_id="run-state-1",
+            repo_path=Path("/repo"),
+            candidates=(cand,),
+            baseline_evidence=base_ev,
+            evidences=(cand_ev,),
+            diagnoses=(diag,),
+            final_status="DIAGNOSED",
+        )
+
+        # Save checkpoint
+        checkpoint = repo.save_checkpoint(
+            state=state,
+            step_index=4,
+            node_name="diagnose_failure_node",
+        )
+
+        assert checkpoint.step_index == 4
+        assert checkpoint.node_name == "diagnose_failure_node"
+        assert checkpoint.run_id == "run-state-1"
+
+        # Retrieve latest checkpoint
+        latest = repo.get_latest_checkpoint("run-state-1")
+        assert latest is not None
+        assert latest.step_index == 4
+        assert latest.node_name == "diagnose_failure_node"
+
+        restored_state = latest.state
+        assert restored_state.run_id == "run-state-1"
+        assert restored_state.repo_path == Path("/repo")
+        assert len(restored_state.candidates) == 1
+        assert restored_state.candidates[0].candidate_id == "c1"
+        assert restored_state.baseline_evidence is not None
+        assert restored_state.baseline_evidence.evidence_id == "ev-base"
+        assert len(restored_state.evidences) == 1
+        assert restored_state.evidences[0].evidence_id == "ev-cand"
+        assert len(restored_state.diagnoses) == 1
+        assert restored_state.diagnoses[0].diagnosis_id == "d1"
+        assert restored_state.final_status == "DIAGNOSED"
+    finally:
+        conn.close()
+
+
+def test_latest_checkpoint_selection_ordering() -> None:
+    """Verifies deterministic selection of latest checkpoint by step_index DESC, created_at DESC, checkpoint_id DESC."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(run_id="run-order", repo_path="/repo", current_commit="c", base_commit="b", branch_name="m")
+
+        state = WorkflowState(run_id="run-order", repo_path=Path("/repo"))
+
+        t0 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 1, 10, 1, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 1, 1, 10, 2, 0, tzinfo=timezone.utc)
+
+        # Step 0
+        repo.save_checkpoint(state, step_index=0, node_name="ingest", checkpoint_id="chk-0", created_at=t0)
+        # Step 1
+        repo.save_checkpoint(state, step_index=1, node_name="plan", checkpoint_id="chk-1", created_at=t1)
+        # Step 2
+        repo.save_checkpoint(state, step_index=2, node_name="execute", checkpoint_id="chk-2", created_at=t2)
+
+        latest = repo.get_latest_checkpoint("run-order")
+        assert latest is not None
+        assert latest.checkpoint_id == "chk-2"
+        assert latest.step_index == 2
+        assert latest.node_name == "execute"
+
+        # Checkpoints list in ascending order
+        all_chks = repo.get_checkpoints("run-order")
+        assert len(all_chks) == 3
+        assert [c.step_index for c in all_chks] == [0, 1, 2]
+    finally:
+        conn.close()
+
+
+def test_empty_retrieval_behavior() -> None:
+    """Verifies that querying non-existent entities returns None or empty list without error."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+
+        assert repo.get_run("does-not-exist") is None
+        assert repo.get_candidate("does-not-exist") is None
+        assert repo.get_evidence("does-not-exist") is None
+        assert repo.get_diagnosis("does-not-exist") is None
+        assert repo.get_latest_checkpoint("does-not-exist") is None
+
+        assert repo.get_candidates("does-not-exist") == []
+        assert repo.get_run_evidence("does-not-exist") == []
+        assert repo.get_diagnoses("does-not-exist") == []
+        assert repo.get_checkpoints("does-not-exist") == []
+    finally:
+        conn.close()
+
+
+def test_input_immutability() -> None:
+    """Verifies that calling repository save methods never mutates caller-owned models."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(run_id="run-immut", repo_path="/repo", current_commit="c", base_commit="b", branch_name="m")
+
+        cand = TestCandidate(
+            candidate_id="c-immut",
+            run_id="run-immut",
+            target_symbol_name="sym",
+            test_file_path=Path("t.py"),
+            candidate_code="code",
+        )
+        dump_before = cand.model_dump()
+        repo.save_candidate(cand)
+        dump_after = cand.model_dump()
+        assert dump_before == dump_after
+
+        ev = ExecutionEvidence(
+            evidence_id="e-immut",
+            run_id="run-immut",
+            candidate_id="c-immut",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_sec=1.0,
+        )
+        dump_ev_before = ev.model_dump()
+        repo.save_evidence(ev)
+        assert dump_ev_before == ev.model_dump()
+    finally:
+        conn.close()
+
+
+def test_cascade_regression_with_repository() -> None:
+    """Verifies that deleting a run cascades through all entities saved via SQLiteRepository."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        repo.save_run(run_id="run-casc", repo_path="/repo", current_commit="c", base_commit="b", branch_name="m")
+        repo.save_candidate(TestCandidate(candidate_id="c1", run_id="run-casc", target_symbol_name="s", test_file_path=Path("t.py"), candidate_code="code"))
+        repo.save_evidence(ExecutionEvidence(evidence_id="e1", run_id="run-casc", candidate_id="c1", exit_code=1, stdout="", stderr="", duration_sec=1.0))
+        repo.save_diagnosis(FailureDiagnosis(diagnosis_id="d1", evidence_id="e1", canonical_category=FailureCategory.UNKNOWN, confidence=0.5, triage_engine=TriageEngine.DETERMINISTIC_RULE, explanation=""))
+        repo.save_checkpoint(WorkflowState(run_id="run-casc", repo_path=Path("/repo")), step_index=0, node_name="start")
+
+        # Delete run
+        conn.execute("DELETE FROM runs WHERE run_id = 'run-casc';")
+        conn.commit()
+
+        assert repo.get_run("run-casc") is None
+        assert repo.get_candidates("run-casc") == []
+        assert repo.get_run_evidence("run-casc") == []
+        assert repo.get_diagnoses("run-casc") == []
+        assert repo.get_checkpoints("run-casc") == []
+    finally:
+        conn.close()
+
+
+def test_event_store_and_repository_coexistence() -> None:
+    """Verifies that SQLiteEventStore and SQLiteRepository operate concurrently on the same database."""
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        store = SQLiteEventStore(conn)
+
+        # 1. Save run
+        repo.save_run(run_id="run-coexist", repo_path="/repo", current_commit="c", base_commit="b", branch_name="m")
+
+        # 2. Emit audit event
+        evt = store.emit_event(run_id="run-coexist", event_type="RUN_STARTED", payload={"version": "1.0"})
+
+        # 3. Save checkpoint
+        chk = repo.save_checkpoint(WorkflowState(run_id="run-coexist", repo_path=Path("/repo")), step_index=0, node_name="init")
+
+        # 4. Save candidate & evidence
+        repo.save_candidate(TestCandidate(candidate_id="c1", run_id="run-coexist", target_symbol_name="s", test_file_path=Path("t.py"), candidate_code="code"))
+        repo.save_evidence(ExecutionEvidence(evidence_id="e1", run_id="run-coexist", candidate_id="c1", exit_code=0, stdout="", stderr="", duration_sec=0.5))
+
+        # 5. Emit completed event
+        store.emit_event(run_id="run-coexist", event_type="RUN_COMPLETED", payload={"status": "OK"})
+
+        # Verify all coexisted
+        events = store.get_events("run-coexist")
+        assert len(events) == 2
+        assert repo.get_run("run-coexist") is not None
+        assert repo.get_latest_checkpoint("run-coexist") is not None
+        assert len(repo.get_candidates("run-coexist")) == 1
+        assert len(repo.get_run_evidence("run-coexist")) == 1
+    finally:
+        conn.close()
