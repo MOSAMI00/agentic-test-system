@@ -6,7 +6,7 @@ All nodes are pure adapter functions operating on immutable WorkflowState models
 using model_copy(update=...). They do NOT perform direct persistence or event emission.
 """
 
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from pathlib import Path
 
 from agentic_test.analysis.service import AnalysisService
@@ -15,6 +15,7 @@ from agentic_test.core.models import (
     ExecutionPlan,
     FailureDiagnosis,
     RepositorySnapshot,
+    SymbolContract,
     TestCandidate,
     ValidationStatus,
 )
@@ -137,13 +138,27 @@ def diagnose_failure_node(
     diagnoses_list: List[FailureDiagnosis] = []
     candidate_by_id = {c.candidate_id: c for c in state.candidates}
 
+    symbol_by_name: Dict[str, SymbolContract] = {}
+    if state.plan and state.plan.target_symbols:
+        for s in state.plan.target_symbols:
+            symbol_by_name[s.qualified_name] = s
+    if state.snapshot and state.snapshot.affected_symbols:
+        for s in state.snapshot.affected_symbols:
+            symbol_by_name.setdefault(s.qualified_name, s)
+
     # 1. Check baseline evidence for failure
     if state.baseline_evidence is not None and state.baseline_evidence.exit_code != 0:
+        baseline_diff = (
+            "\n".join(h.content for h in state.snapshot.diff_hunks)
+            if state.snapshot and state.snapshot.diff_hunks
+            else None
+        )
         diag = diagnosis_service.diagnose(
             evidence=state.baseline_evidence,
             candidate=None,
             candidate_code=None,
             target_symbol=None,
+            diff_content=baseline_diff,
         )
         diagnoses_list.append(diag)
 
@@ -153,11 +168,34 @@ def diagnose_failure_node(
             cand = candidate_by_id.get(ev.candidate_id) if ev.candidate_id else None
             cand_code = cand.candidate_code if cand else None
             target_sym = cand.target_symbol_name if cand else None
+
+            resolved_symbol: Optional[Union[str, SymbolContract]] = target_sym
+            candidate_diff: Optional[str] = None
+            if cand and target_sym:
+                symbol_contract = symbol_by_name.get(target_sym)
+                if symbol_contract is not None:
+                    resolved_symbol = symbol_contract
+                    if state.snapshot and state.snapshot.diff_hunks:
+                        relevant_hunks = [
+                            h.content for h in state.snapshot.diff_hunks
+                            if h.file_path == symbol_contract.file_path or h.file_path.name == symbol_contract.file_path.name
+                        ]
+                        if relevant_hunks:
+                            candidate_diff = "\n".join(relevant_hunks)
+                elif state.snapshot and state.snapshot.diff_hunks:
+                    matching = [
+                        h.content for h in state.snapshot.diff_hunks
+                        if target_sym in h.content
+                    ]
+                    if matching:
+                        candidate_diff = "\n".join(matching)
+
             diag = diagnosis_service.diagnose(
                 evidence=ev,
                 candidate=cand,
                 candidate_code=cand_code,
-                target_symbol=target_sym,
+                target_symbol=resolved_symbol,
+                diff_content=candidate_diff,
             )
             diagnoses_list.append(diag)
 
