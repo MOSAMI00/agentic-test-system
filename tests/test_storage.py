@@ -1,0 +1,588 @@
+"""
+Unit tests for SQLite database connection policy, DDL schema, and relational integrity.
+Adheres strictly to Stage 3 Section 4.4.7 (Listing 4.4) and Slice 1.6.2A contracts.
+"""
+
+from pathlib import Path
+import sqlite3
+from typing import Dict, List, Set
+
+import pytest
+
+from agentic_test.storage.database import (
+    SCHEMA_DDL,
+    get_connection,
+    init_database,
+    init_db,
+)
+
+
+def _get_table_names(conn: sqlite3.Connection) -> Set[str]:
+    """Helper returning set of non-sqlite table names in database."""
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';"
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
+def _get_index_names(conn: sqlite3.Connection) -> Set[str]:
+    """Helper returning set of non-autoindex index names in database."""
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%';"
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
+def _get_table_columns(conn: sqlite3.Connection, table_name: str) -> Dict[str, Dict[str, object]]:
+    """Helper returning column metadata for a given table."""
+    cursor = conn.execute(f"PRAGMA table_info({table_name});")
+    return {
+        row["name"]: {
+            "type": row["type"],
+            "notnull": bool(row["notnull"]),
+            "dflt_value": row["dflt_value"],
+            "pk": bool(row["pk"]),
+        }
+        for row in cursor.fetchall()
+    }
+
+
+# ============================================================================
+# 1. Connection Policy & Pragmas Tests
+# ============================================================================
+
+def test_memory_connection_pragmas() -> None:
+    """Verifies that in-memory database sets FK=ON, busy_timeout=5000, and journal_mode=memory."""
+    conn = get_connection(":memory:")
+    try:
+        fk = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
+        timeout = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+
+        assert fk == 1, "Foreign keys must be enabled"
+        assert timeout == 5000, "Busy timeout must be 5000ms"
+        assert journal == "memory", "In-memory database should retain native memory journal"
+
+        # Verify row_factory is sqlite3.Row
+        assert conn.row_factory == sqlite3.Row
+        row = conn.execute("SELECT 1 AS col_val;").fetchone()
+        assert row["col_val"] == 1
+    finally:
+        conn.close()
+
+
+def test_memory_uri_connection_pragmas() -> None:
+    """Verifies that URI-based in-memory connections accept memory journal mode without error."""
+    conn = get_connection("file:mem_test?mode=memory&cache=shared")
+    try:
+        fk = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+
+        assert fk == 1
+        assert journal == "memory"
+    finally:
+        conn.close()
+
+
+def test_disk_connection_pragmas(tmp_path: Path) -> None:
+    """Verifies that on-disk database sets FK=ON, busy_timeout=5000, WAL mode, and synchronous=FULL."""
+    db_file = tmp_path / "persistence.db"
+    conn = get_connection(db_file)
+    try:
+        fk = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
+        timeout = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+        sync = conn.execute("PRAGMA synchronous;").fetchone()[0]
+
+        assert fk == 1, "Foreign keys must be enabled on disk"
+        assert timeout == 5000, "Busy timeout must be 5000ms"
+        assert journal.lower() == "wal", "On-disk database must configure WAL journal mode"
+        assert sync == 2, "On-disk database must configure synchronous=FULL (code 2) for power durability"
+    finally:
+        conn.close()
+
+
+def test_disk_connection_with_path_string(tmp_path: Path) -> None:
+    """Verifies that string path arguments are handled properly for on-disk databases."""
+    db_file_str = str(tmp_path / "str_path.db")
+    conn = get_connection(db_file_str)
+    try:
+        journal = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+        assert journal.lower() == "wal"
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# 2. Schema DDL & Index Verification Tests
+# ============================================================================
+
+def test_all_six_tables_created() -> None:
+    """Verifies that init_db creates all six required normalized tables."""
+    conn = get_connection(":memory:")
+    try:
+        init_db(conn)
+        tables = _get_table_names(conn)
+        expected = {
+            "runs",
+            "checkpoints",
+            "events",
+            "test_candidates",
+            "execution_evidence",
+            "failure_diagnoses",
+        }
+        assert expected.issubset(tables), f"Missing tables: {expected - tables}"
+    finally:
+        conn.close()
+
+
+def test_all_required_indices_created() -> None:
+    """Verifies that all 5 secondary indices are created in sqlite_master."""
+    conn = get_connection(":memory:")
+    try:
+        init_db(conn)
+        indices = _get_index_names(conn)
+        expected = {
+            "idx_checkpoints_run_id",
+            "idx_events_run_id_type",
+            "idx_candidates_run_status",
+            "idx_evidence_run_id",
+            "idx_diagnoses_run_cat",
+        }
+        assert expected.issubset(indices), f"Missing indices: {expected - indices}"
+    finally:
+        conn.close()
+
+
+def test_table_columns_and_data_types() -> None:
+    """Verifies column names, nullability, and coverage delta definitions."""
+    conn = get_connection(":memory:")
+    try:
+        init_db(conn)
+
+        # 1. execution_evidence checks
+        evidence_cols = _get_table_columns(conn, "execution_evidence")
+        assert "evidence_id" in evidence_cols and evidence_cols["evidence_id"]["pk"]
+        assert "candidate_id" in evidence_cols
+        assert evidence_cols["candidate_id"]["notnull"] is False, "candidate_id must be nullable for baseline runs"
+        assert "line_coverage_delta" in evidence_cols
+        assert "branch_coverage_delta" in evidence_cols
+        assert "line_coverage" in evidence_cols
+        assert "branch_coverage" in evidence_cols
+        assert "duration_sec" in evidence_cols
+        assert "timed_out" in evidence_cols
+
+        # 2. test_candidates checks
+        candidate_cols = _get_table_columns(conn, "test_candidates")
+        assert "candidate_id" in candidate_cols and candidate_cols["candidate_id"]["pk"]
+        assert "target_symbol" in candidate_cols
+        assert "retry_count" in candidate_cols
+        assert candidate_cols["retry_count"]["dflt_value"] in ("0", 0)
+
+        # 3. failure_diagnoses checks
+        diag_cols = _get_table_columns(conn, "failure_diagnoses")
+        assert "diagnosis_id" in diag_cols and diag_cols["diagnosis_id"]["pk"]
+        assert "canonical_category" in diag_cols
+        assert "triage_engine" in diag_cols
+        assert "is_application_bug" in diag_cols
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# 3. Foreign Key Enforcement & Orphan Rejection Tests
+# ============================================================================
+
+def test_orphan_checkpoints_rejected() -> None:
+    """Verifies that inserting a checkpoint with a non-existent run_id is rejected."""
+    conn = init_database(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO checkpoints (checkpoint_id, run_id, step_index, node_name, state_payload, created_at) "
+                "VALUES ('chk-1', 'nonexistent-run', 0, 'ingest_node', '{}', '2026-01-01T00:00:00Z');"
+            )
+    finally:
+        conn.close()
+
+
+def test_orphan_events_rejected() -> None:
+    """Verifies that inserting an event with a non-existent run_id is rejected."""
+    conn = init_database(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO events (event_id, run_id, event_type, node_name, payload, emitted_at) "
+                "VALUES ('evt-1', 'nonexistent-run', 'RUN_STARTED', 'init', '{}', '2026-01-01T00:00:00Z');"
+            )
+    finally:
+        conn.close()
+
+
+def test_orphan_candidates_rejected() -> None:
+    """Verifies that inserting a candidate with a non-existent run_id is rejected."""
+    conn = init_database(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+                "VALUES ('cand-1', 'nonexistent-run', 'foo', 'tests/test_foo.py', 'def test(): pass', 'PASSED', '2026-01-01T00:00:00Z');"
+            )
+    finally:
+        conn.close()
+
+
+def test_orphan_evidence_rejected() -> None:
+    """Verifies that inserting evidence with a non-existent run_id or candidate_id is rejected."""
+    conn = init_database(":memory:")
+    try:
+        # Non-existent run_id
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+                "VALUES ('ev-1', 'nonexistent-run', NULL, 0, 1.0, '2026-01-01T00:00:00Z');"
+            )
+
+        # Create valid run
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+
+        # Non-existent candidate_id (when candidate_id is provided)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+                "VALUES ('ev-2', 'run-1', 'nonexistent-candidate', 0, 1.0, '2026-01-01T00:00:00Z');"
+            )
+    finally:
+        conn.close()
+
+
+def test_orphan_diagnosis_rejected() -> None:
+    """Verifies that inserting a diagnosis with a non-existent evidence_id or run_id is rejected."""
+    conn = init_database(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO failure_diagnoses (diagnosis_id, run_id, evidence_id, canonical_category, confidence, triage_engine, explanation, created_at) "
+                "VALUES ('diag-1', 'run-1', 'nonexistent-evidence', 'APPLICATION_BUG', 1.0, 'DETERMINISTIC_RULE', 'Bug', '2026-01-01T00:00:00Z');"
+            )
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# 4. Cascading Deletion Tests (Run, Candidate, Evidence)
+# ============================================================================
+
+def test_run_level_cascading_deletion() -> None:
+    """Verifies that deleting a run row cascades across all five child tables."""
+    conn = init_database(":memory:")
+    try:
+        # Populate full execution hierarchy
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+        conn.execute(
+            "INSERT INTO checkpoints (checkpoint_id, run_id, step_index, node_name, state_payload, created_at) "
+            "VALUES ('chk-1', 'run-1', 0, 'ingest', '{}', '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO events (event_id, run_id, event_type, node_name, payload, emitted_at) "
+            "VALUES ('evt-1', 'run-1', 'RUN_STARTED', 'init', '{}', '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-1', 'run-1', 'sym', 'test.py', 'code', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+            "VALUES ('ev-1', 'run-1', 'cand-1', 1, 0.5, '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO failure_diagnoses (diagnosis_id, run_id, evidence_id, canonical_category, confidence, triage_engine, explanation, created_at) "
+            "VALUES ('diag-1', 'run-1', 'ev-1', 'APPLICATION_BUG', 1.0, 'DETERMINISTIC_RULE', 'Bug', '2026-01-01T00:00:00Z');"
+        )
+
+        # Verify all records inserted
+        assert conn.execute("SELECT COUNT(*) FROM checkpoints WHERE run_id = 'run-1';").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE run_id = 'run-1';").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM test_candidates WHERE run_id = 'run-1';").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM execution_evidence WHERE run_id = 'run-1';").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM failure_diagnoses WHERE run_id = 'run-1';").fetchone()[0] == 1
+
+        # Delete parent run
+        conn.execute("DELETE FROM runs WHERE run_id = 'run-1';")
+
+        # Verify all child tables cleanly cascaded to 0
+        assert conn.execute("SELECT COUNT(*) FROM checkpoints;").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM events;").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM test_candidates;").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM execution_evidence;").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM failure_diagnoses;").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_candidate_level_cascading_deletion() -> None:
+    """Verifies that deleting a candidate cascades to its execution evidence and failure diagnoses."""
+    conn = init_database(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+        # Candidate 1 with evidence and diagnosis
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-1', 'run-1', 'sym1', 'test1.py', 'code1', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+            "VALUES ('ev-1', 'run-1', 'cand-1', 1, 0.5, '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO failure_diagnoses (diagnosis_id, run_id, evidence_id, canonical_category, confidence, triage_engine, explanation, created_at) "
+            "VALUES ('diag-1', 'run-1', 'ev-1', 'APPLICATION_BUG', 1.0, 'DETERMINISTIC_RULE', 'Bug', '2026-01-01T00:00:00Z');"
+        )
+
+        # Candidate 2 with separate evidence and diagnosis
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-2', 'run-1', 'sym2', 'test2.py', 'code2', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+            "VALUES ('ev-2', 'run-1', 'cand-2', 1, 0.7, '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO failure_diagnoses (diagnosis_id, run_id, evidence_id, canonical_category, confidence, triage_engine, explanation, created_at) "
+            "VALUES ('diag-2', 'run-1', 'ev-2', 'TEST_OUTDATED', 0.9, 'COGNITIVE_LLM', 'Outdated', '2026-01-01T00:00:00Z');"
+        )
+
+        # Delete cand-1
+        conn.execute("DELETE FROM test_candidates WHERE candidate_id = 'cand-1';")
+
+        # Verify cand-1 artifacts are deleted
+        assert conn.execute("SELECT COUNT(*) FROM execution_evidence WHERE candidate_id = 'cand-1';").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM failure_diagnoses WHERE diagnosis_id = 'diag-1';").fetchone()[0] == 0
+
+        # Verify cand-2 artifacts remain intact
+        assert conn.execute("SELECT COUNT(*) FROM execution_evidence WHERE candidate_id = 'cand-2';").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM failure_diagnoses WHERE diagnosis_id = 'diag-2';").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_evidence_level_cascading_deletion() -> None:
+    """Verifies that deleting an execution evidence cascades to its failure diagnosis while candidate is preserved."""
+    conn = init_database(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-1', 'run-1', 'sym1', 'test1.py', 'code1', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+            "VALUES ('ev-1', 'run-1', 'cand-1', 1, 0.5, '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO failure_diagnoses (diagnosis_id, run_id, evidence_id, canonical_category, confidence, triage_engine, explanation, created_at) "
+            "VALUES ('diag-1', 'run-1', 'ev-1', 'APPLICATION_BUG', 1.0, 'DETERMINISTIC_RULE', 'Bug', '2026-01-01T00:00:00Z');"
+        )
+
+        # Delete evidence
+        conn.execute("DELETE FROM execution_evidence WHERE evidence_id = 'ev-1';")
+
+        # Diagnosis must be cascade-deleted
+        assert conn.execute("SELECT COUNT(*) FROM failure_diagnoses WHERE diagnosis_id = 'diag-1';").fetchone()[0] == 0
+        # Candidate must remain preserved
+        assert conn.execute("SELECT COUNT(*) FROM test_candidates WHERE candidate_id = 'cand-1';").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# 5. Baseline Evidence & Multi-Evidence Tests
+# ============================================================================
+
+def test_baseline_evidence_nullable_candidate_id() -> None:
+    """Verifies that execution_evidence accepts candidate_id = NULL for baseline regression evidence."""
+    conn = init_database(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+
+        # Insert baseline evidence (no candidate)
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, line_coverage, branch_coverage, created_at) "
+            "VALUES ('ev-base-1', 'run-1', NULL, 0, 2.5, 75.0, 70.0, '2026-01-01T00:00:00Z');"
+        )
+
+        # Insert second baseline evidence (e.g. repeated baseline check)
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, line_coverage, branch_coverage, created_at) "
+            "VALUES ('ev-base-2', 'run-1', NULL, 0, 2.3, 75.0, 70.0, '2026-01-01T00:00:05Z');"
+        )
+
+        rows = conn.execute(
+            "SELECT evidence_id, candidate_id, exit_code FROM execution_evidence WHERE candidate_id IS NULL;"
+        ).fetchall()
+
+        assert len(rows) == 2
+        assert rows[0]["candidate_id"] is None
+        assert rows[1]["candidate_id"] is None
+    finally:
+        conn.close()
+
+
+def test_multiple_evidence_rows_per_candidate_allowed() -> None:
+    """Verifies that multiple evidence rows for the same candidate are permitted by schema."""
+    conn = init_database(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-1', 'run-1', 'sym', 'test.py', 'code', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+
+        # Execution attempt 1
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+            "VALUES ('ev-attempt-1', 'run-1', 'cand-1', 1, 0.4, '2026-01-01T00:00:01Z');"
+        )
+        # Execution attempt 2
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+            "VALUES ('ev-attempt-2', 'run-1', 'cand-1', 0, 0.5, '2026-01-01T00:00:05Z');"
+        )
+
+        ev_count = conn.execute(
+            "SELECT COUNT(*) FROM execution_evidence WHERE candidate_id = 'cand-1';"
+        ).fetchone()[0]
+        assert ev_count == 2, "Multiple execution evidence records must be allowed per candidate"
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# 6. Composite Foreign Key / Cross-Run Reference Rejection Tests
+# ============================================================================
+
+def test_cross_run_candidate_reference_rejected() -> None:
+    """Verifies that execution_evidence cannot reference a candidate belonging to a different run."""
+    conn = init_database(":memory:")
+    try:
+        # Create Run A and Candidate A
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-A', '/repoA', 'cA', 'bA', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-A', 'run-A', 'symA', 'testA.py', 'codeA', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+
+        # Create Run B
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-B', '/repoB', 'cB', 'bB', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+
+        # Attempt to insert evidence in Run B referencing Candidate A -> Must be rejected by composite FK!
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+                "VALUES ('ev-cross', 'run-B', 'cand-A', 0, 1.0, '2026-01-01T00:00:00Z');"
+            )
+    finally:
+        conn.close()
+
+
+def test_cross_run_evidence_reference_rejected() -> None:
+    """Verifies that failure_diagnoses cannot reference evidence belonging to a different run."""
+    conn = init_database(":memory:")
+    try:
+        # Create Run A, Candidate A, Evidence A
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-A', '/repoA', 'cA', 'bA', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-A', 'run-A', 'symA', 'testA.py', 'codeA', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+        conn.execute(
+            "INSERT INTO execution_evidence (evidence_id, run_id, candidate_id, exit_code, duration_sec, created_at) "
+            "VALUES ('ev-A', 'run-A', 'cand-A', 1, 0.5, '2026-01-01T00:00:00Z');"
+        )
+
+        # Create Run B
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-B', '/repoB', 'cB', 'bB', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+
+        # Attempt to insert diagnosis in Run B referencing Evidence A -> Must be rejected by composite FK!
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO failure_diagnoses (diagnosis_id, run_id, evidence_id, canonical_category, confidence, triage_engine, explanation, created_at) "
+                "VALUES ('diag-cross', 'run-B', 'ev-A', 'APPLICATION_BUG', 1.0, 'DETERMINISTIC_RULE', 'Bug', '2026-01-01T00:00:00Z');"
+            )
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# 7. Idempotence & Data Preservation Tests
+# ============================================================================
+
+def test_init_db_idempotent_and_preserves_data() -> None:
+    """Verifies that calling init_db repeatedly does not raise errors and preserves existing rows."""
+    conn = get_connection(":memory:")
+    try:
+        # First call
+        init_db(conn)
+
+        # Insert baseline data
+        conn.execute(
+            "INSERT INTO runs (run_id, repo_path, current_commit, base_commit, branch_name, started_at, final_status) "
+            "VALUES ('run-1', '/repo', 'c1', 'b1', 'main', '2026-01-01T00:00:00Z', 'INITIALIZED');"
+        )
+        conn.execute(
+            "INSERT INTO test_candidates (candidate_id, run_id, target_symbol, test_file_path, candidate_code, validation_status, created_at) "
+            "VALUES ('cand-1', 'run-1', 'sym', 'test.py', 'code', 'PASSED', '2026-01-01T00:00:00Z');"
+        )
+
+        # Second call to init_db
+        init_db(conn)
+
+        # Third call to init_db
+        init_db(conn)
+
+        # Assert data is preserved
+        run_row = conn.execute("SELECT run_id, current_commit FROM runs WHERE run_id = 'run-1';").fetchone()
+        assert run_row["run_id"] == "run-1"
+        assert run_row["current_commit"] == "c1"
+
+        cand_row = conn.execute("SELECT candidate_id, target_symbol FROM test_candidates WHERE candidate_id = 'cand-1';").fetchone()
+        assert cand_row["candidate_id"] == "cand-1"
+        assert cand_row["target_symbol"] == "sym"
+    finally:
+        conn.close()
