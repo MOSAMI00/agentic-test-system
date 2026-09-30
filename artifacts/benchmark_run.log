@@ -1,0 +1,95 @@
+================================================================================
+AGENTIC TEST GENERATION AND MAINTENANCE SYSTEM - BENCHMARK EXECUTION LOG
+Milestone M1.6 End-to-End Offline Benchmark Verification
+================================================================================
+
+1. EXECUTION METADATA
+--------------------------------------------------------------------------------
+Command Line:       agentic-test run --repo <sanitized_repo_path> --db <sanitized_db_path> --offline
+Repository Path:    <sanitized_repo_path>
+Baseline Commit:    2ad33137e7c06e662813d680dbf41380ea45b200
+Database Path:      <sanitized_db_path>
+Execution Mode:     OFFLINE (Hermetic, Mock Adapters)
+Route Selected:     ROUTE_NO_OP
+Final Run Status:   COMPLETED
+
+2. SAFETY AND HERMETICITY GUARANTEES
+--------------------------------------------------------------------------------
+[VERIFIED] Pure hermetic offline execution mode active (--offline).
+[VERIFIED] Wired through production service factory: default_create_workflow_engine(..., offline=True).
+[VERIFIED] Injected MockLLMService and MockSandboxManager.
+[VERIFIED] Zero external network requests made (Gemini, OpenAI, LiteLLM disabled).
+[VERIFIED] Zero Docker daemon interaction.
+[VERIFIED] Zero candidate execution on host machine.
+[VERIFIED] Fixture route is ROUTE_NO_OP (clean baseline repository).
+           This benchmark validates the no-op path only; does not claim
+           candidate generation or sandbox verification coverage.
+
+3. CAPTURED CONSOLE OUTPUT (RICH TERMINAL PRESENTATION)
+--------------------------------------------------------------------------------
+┌────────────── Agentic Test Generation and Maintenance System ───────────────┐
+│                                                                             │
+│  Run ID:          run-5479f1ae33c4                                          │
+│  Repository:      <repo_path>                                               │
+│  Database:        <db_path>                                                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+          Execution Summary           
+┌──────────────────────┬─────────────┐
+│ Property             │ Value       │
+├──────────────────────┼─────────────┤
+│ Final Status         │ COMPLETED   │
+│ Selected Route       │ ROUTE_NO_OP │
+│ Target Symbols       │ 0           │
+│ Generated Candidates │ 0           │
+│ Execution Evidences  │ 0           │
+│ Failure Diagnoses    │ 0           │
+└──────────────────────┴─────────────┘
+--------------------------------------------------------------------------------
+
+4. SQLITE SCHEMA VERIFICATION (ALL 6 REQUIRED TABLES)
+--------------------------------------------------------------------------------
+Table Name                Status         
+--------------------------------------------------------------------------------
+checkpoints               PRESENT [Verified]
+events                    PRESENT [Verified]
+execution_evidence        PRESENT [Verified]
+failure_diagnoses         PRESENT [Verified]
+runs                      PRESENT [Verified]
+test_candidates           PRESENT [Verified]
+
+5. SQLITE TABLE ROW COUNTS
+--------------------------------------------------------------------------------
+Table Name                Row Count    Expected                      
+--------------------------------------------------------------------------------
+checkpoints               4            4 (Steps 0, 1, 2, 7)          
+events                    7            7 (CONFIG_MODE + 3 node pairs)
+execution_evidence        0            0 (Empty for ROUTE_NO_OP)     
+failure_diagnoses         0            0 (Empty for ROUTE_NO_OP)     
+runs                      1            1 (Matching executed run)     
+test_candidates           0            0 (Empty for ROUTE_NO_OP)     
+
+6. VERIFIED CHECKPOINT SEQUENCE
+--------------------------------------------------------------------------------
+Step Index   Node Name                      Status         
+--------------------------------------------------------------------------------
+0            initialized                    COMPLETED      
+1            ingest_and_analyze_node        COMPLETED      
+2            plan_execution_node            COMPLETED      
+7            report_node                    COMPLETED      
+
+7. VERIFIED EVENT SEQUENCE
+--------------------------------------------------------------------------------
+Seq    Event Type           Payload Summary                                   
+--------------------------------------------------------------------------------
+1      CONFIG_MODE          {'offline': True}                                 
+2      NODE_STARTED         {'step_index': 1}                                 
+3      NODE_COMPLETED       {'step_index': 1}                                 
+4      NODE_STARTED         {'step_index': 2}                                 
+5      NODE_COMPLETED       {'step_index': 2}                                 
+6      NODE_STARTED         {'step_index': 7}                                 
+7      NODE_COMPLETED       {'step_index': 7}                                 
+
+================================================================================
+END OF BENCHMARK VERIFICATION LOG
+================================================================================
