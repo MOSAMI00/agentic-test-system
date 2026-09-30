@@ -6,9 +6,10 @@ Iteration 1.4 Component Architecture.
 import ast
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from agentic_test.core.models import (
+    DiffHunk,
     ExecutionPlan,
     SymbolContract,
     TestCandidate,
@@ -50,7 +51,11 @@ class GenerationService:
         self._run_id = run_id
         self._repo_root = repo_root
 
-    def generate(self, plan: ExecutionPlan) -> List[TestCandidate]:
+    def generate(
+        self,
+        plan: ExecutionPlan,
+        diff_hunks: Sequence[DiffHunk] = (),
+    ) -> List[TestCandidate]:
         """
         Generates TestCandidate instances strictly for plan.target_symbols.
         Pre-validation repairs are capped at R_max = 2.
@@ -63,6 +68,7 @@ class GenerationService:
             candidate = self._generate_candidate_for_symbol(
                 target_symbol=target_symbol,
                 run_id=effective_run_id,
+                diff_hunks=diff_hunks,
             )
             candidates.append(candidate)
 
@@ -72,6 +78,7 @@ class GenerationService:
         self,
         target_symbol: SymbolContract,
         run_id: str,
+        diff_hunks: Sequence[DiffHunk] = (),
     ) -> TestCandidate:
         """
         Synthesizes and repairs a test candidate for an individual symbol.
@@ -84,6 +91,7 @@ class GenerationService:
             context = self._context_assembler.assemble(
                 target_symbol=target_symbol,
                 repo_root=self._repo_root,
+                diff_hunks=diff_hunks,
             )
         except ContextBudgetExceededError as err:
             return TestCandidate(

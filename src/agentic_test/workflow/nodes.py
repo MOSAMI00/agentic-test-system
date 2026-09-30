@@ -63,7 +63,8 @@ def generate_tests_node(
     """
     if state.plan is None:
         raise ValueError("ExecutionPlan is required for generate_tests_node")
-    generated = generation_service.generate(state.plan)
+    diff_hunks = state.snapshot.diff_hunks if state.snapshot is not None else ()
+    generated = generation_service.generate(state.plan, diff_hunks=diff_hunks)
     return state.model_copy(update={"candidates": tuple(generated)})
 
 
