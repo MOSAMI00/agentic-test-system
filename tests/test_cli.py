@@ -11,7 +11,17 @@ import pytest
 from typer.testing import CliRunner
 
 from agentic_test.cli.app import app
-from agentic_test.cli.service_factory import set_engine_factory
+from agentic_test.cli.service_factory import (
+    ConfigurationError,
+    default_create_workflow_engine,
+    set_engine_factory,
+)
+from agentic_test.diagnosis.service import DiagnosisService
+from agentic_test.execution.mock_sandbox import MockSandboxManager
+from agentic_test.execution.service import ExecutionService
+from agentic_test.generation.mock_llm import MockLLMService
+from agentic_test.generation.service import GenerationService
+from agentic_test.validation.pipeline import ValidationPipeline
 from agentic_test.core.models import (
     ExecutionEvidence,
     ExecutionPlan,
@@ -411,3 +421,103 @@ def test_cli_resume_failure_exit_1(runner: CliRunner, git_repo: Path, db_path: P
     result = runner.invoke(app, ["resume", "run-resume-fail", "--db", str(db_path)])
     assert result.exit_code == 1
     assert "Fatal planner exception" in result.stdout
+
+
+# ============================================================================
+# 4. Service Factory & Offline Mode Tests (WBS 1.6.4A)
+# ============================================================================
+
+def test_default_factory_offline_mode(git_repo: Path, db_path: Path) -> None:
+    """Verifies that default_create_workflow_engine(offline=True) constructs all mock domain services."""
+    engine = default_create_workflow_engine(db_path=db_path, repo_path=git_repo, offline=True)
+    assert isinstance(engine, WorkflowEngine)
+    assert isinstance(engine.generation_service, GenerationService)
+    assert isinstance(engine.generation_service._llm_service, MockLLMService)
+    assert isinstance(engine.execution_service, ExecutionService)
+    assert isinstance(engine.execution_service._sandbox_manager, MockSandboxManager)
+    assert isinstance(engine.validation_pipeline, ValidationPipeline)
+    assert isinstance(engine.diagnosis_service, DiagnosisService)
+
+
+def test_default_factory_live_mode_missing_credentials_fails(git_repo: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that default_create_workflow_engine(offline=False) raises ConfigurationError when OPENAI_API_KEY is unset."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    from agentic_test.core.config import settings
+    monkeypatch.setattr(settings, "openai_api_key", None)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        default_create_workflow_engine(db_path=db_path, repo_path=git_repo, offline=False)
+
+    assert "Live LLM service unavailable" in str(exc_info.value)
+    assert "--offline" in str(exc_info.value)
+
+
+def test_cli_run_without_offline_fails_with_exit_code_2(runner: CliRunner, git_repo: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies running without --offline fails closed with exit code 2 and configuration guidance."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    from agentic_test.core.config import settings
+    monkeypatch.setattr(settings, "openai_api_key", None)
+
+    result = runner.invoke(app, ["run", "--repo", str(git_repo), "--db", str(db_path)])
+    assert result.exit_code == 2
+    assert "Live LLM service unavailable" in result.stdout
+    assert "--offline" in result.stdout
+
+
+def test_cli_run_with_offline_flag_succeeds(runner: CliRunner, git_repo: Path, db_path: Path) -> None:
+    """Verifies running with --offline completes successfully with exit code 0 using mock adapters."""
+    result = runner.invoke(app, ["run", "--repo", str(git_repo), "--db", str(db_path), "--offline"])
+    assert result.exit_code == 0
+    assert "Execution Summary" in result.stdout
+    assert "COMPLETED" in result.stdout
+
+
+def test_cli_resume_incompatible_offline_mode_exits_2(runner: CliRunner, git_repo: Path, db_path: Path) -> None:
+    """Verifies attempting to resume a run with mismatched offline mode exits with code 2."""
+    conn = init_database(db_path)
+    repo = SQLiteRepository(conn)
+    event_store = SQLiteEventStore(conn)
+
+    state = WorkflowState(
+        run_id="run-mode-mismatch",
+        repo_path=git_repo,
+        snapshot=RepositorySnapshot(
+            repo_path=git_repo,
+            current_commit="c1",
+            base_commit="c0",
+            branch_name="main",
+            source_tree_hash="sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            is_valid=True,
+        ),
+        plan=ExecutionPlan(
+            plan_id="plan-mismatch",
+            route=WorkflowRoute.ROUTE_NO_OP,
+            decision_hash="dhash",
+            rationale="No op",
+        ),
+    )
+    repo.save_run(
+        run_id="run-mode-mismatch",
+        repo_path=git_repo,
+        current_commit="c1",
+        base_commit="c0",
+        branch_name="main",
+        final_status="RUNNING",
+    )
+    event_store.emit_event(
+        run_id="run-mode-mismatch",
+        event_type="CONFIG_MODE",
+        payload={"offline": True},
+    )
+    repo.save_checkpoint(state=state, step_index=2, node_name="plan_execution_node")
+
+    # Attempt resume without --offline
+    res = runner.invoke(app, ["resume", "run-mode-mismatch", "--db", str(db_path)])
+    assert res.exit_code == 2
+    assert "Incompatible resume mode" in res.stdout
+
+
+def test_cli_package_main_entry_point() -> None:
+    """Verifies that `agentic_test.cli.__main__` module exposes a callable entry point."""
+    import agentic_test.cli.__main__ as cli_main
+    assert callable(cli_main.main)

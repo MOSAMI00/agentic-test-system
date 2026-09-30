@@ -18,8 +18,11 @@ from agentic_test.cli.console import (
     print_run_header,
     print_workflow_summary,
 )
-from agentic_test.cli.service_factory import create_workflow_engine
+from agentic_test.cli.service_factory import ConfigurationError, create_workflow_engine
 from agentic_test.core.state import WorkflowState
+from agentic_test.storage.database import init_database
+from agentic_test.storage.events import SQLiteEventStore
+from agentic_test.storage.repository import SQLiteRepository
 from agentic_test.workflow.recovery import RecoveryError, resume_run
 
 app = typer.Typer(
@@ -55,14 +58,42 @@ def validate_repo_path(repo_path: Path) -> Path:
     return repo_path.resolve()
 
 
-def _execute_new_run(repo_path: Path, db_path: Path) -> None:
+def _execute_new_run(repo_path: Path, db_path: Path, offline: bool = False) -> None:
     """Executes a new end-to-end test generation run."""
     resolved_repo = validate_repo_path(repo_path)
     run_id = f"run-{uuid.uuid4().hex[:12]}"
 
     print_run_header(run_id=run_id, repo_path=resolved_repo, db_path=db_path)
 
-    engine = create_workflow_engine(db_path=db_path, repo_path=resolved_repo)
+    try:
+        engine = create_workflow_engine(
+            db_path=db_path,
+            repo_path=resolved_repo,
+            offline=offline,
+        )
+    except ConfigurationError as exc:
+        print_error(str(exc))
+        raise typer.Exit(code=2)
+
+    # Persist initial run record before emitting event to satisfy foreign key constraints
+    conn = init_database(db_path)
+    repo = SQLiteRepository(conn)
+    event_store = SQLiteEventStore(conn)
+
+    repo.save_run(
+        run_id=run_id,
+        repo_path=resolved_repo,
+        current_commit="unknown",
+        base_commit="unknown",
+        branch_name="unknown",
+        final_status="INITIALIZED",
+    )
+    event_store.emit_event(
+        run_id=run_id,
+        event_type="CONFIG_MODE",
+        payload={"offline": offline},
+    )
+
     initial_state = WorkflowState(run_id=run_id, repo_path=resolved_repo)
 
     try:
@@ -78,18 +109,59 @@ def _execute_new_run(repo_path: Path, db_path: Path) -> None:
     raise typer.Exit(code=0)
 
 
-def _execute_resume(run_id: str, db_path: Path) -> None:
+def _execute_resume(run_id: str, db_path: Path, offline: bool = False) -> None:
     """Resumes an interrupted workflow run from its latest SQLite checkpoint."""
     if not run_id or not run_id.strip():
         print_error("Invalid run_id: run_id cannot be empty.")
         raise typer.Exit(code=2)
 
     clean_run_id = run_id.strip()
-    engine = create_workflow_engine(db_path=db_path)
+    conn = init_database(db_path)
+    repo = SQLiteRepository(conn)
+    event_store = SQLiteEventStore(conn)
 
-    checkpoint = engine.repository.get_latest_checkpoint(clean_run_id)
-    if checkpoint is not None:
-        print_recovery_header(clean_run_id, checkpoint)
+    checkpoint = repo.get_latest_checkpoint(clean_run_id)
+    if checkpoint is None:
+        print_error(f"No checkpoint found for run '{clean_run_id}'. Cannot resume.")
+        raise typer.Exit(code=2)
+
+    print_recovery_header(clean_run_id, checkpoint)
+
+    # Validate terminal status before attempting engine initialization
+    run_record = repo.get_run(clean_run_id)
+    if run_record is not None and run_record.final_status in ("COMPLETED", "FAILED"):
+        print_error(
+            f"Cannot resume run '{clean_run_id}': run is already in terminal status '{run_record.final_status}'."
+        )
+        raise typer.Exit(code=2)
+    if checkpoint.step_index >= 7 or checkpoint.state.final_status in ("COMPLETED", "FAILED"):
+        print_error(
+            f"Cannot resume run '{clean_run_id}': latest checkpoint (step {checkpoint.step_index}) is terminal."
+        )
+        raise typer.Exit(code=2)
+
+    # Enforce mode consistency between run and resumption
+    mode_events = event_store.get_events(clean_run_id, event_type="CONFIG_MODE")
+    if mode_events:
+        orig_offline = bool(mode_events[0].payload.get("offline", False))
+        if orig_offline != offline:
+            print_error(
+                f"Incompatible resume mode: Run '{clean_run_id}' was started with offline={orig_offline}, "
+                f"but resume requested offline={offline}."
+            )
+            raise typer.Exit(code=2)
+
+    try:
+        engine = create_workflow_engine(
+            db_path=db_path,
+            repo_path=checkpoint.state.repo_path,
+            offline=offline,
+            repository=repo,
+            event_store=event_store,
+        )
+    except ConfigurationError as exc:
+        print_error(str(exc))
+        raise typer.Exit(code=2)
 
     try:
         final_state = resume_run(run_id=clean_run_id, engine=engine)
@@ -125,12 +197,17 @@ def run_command(
         "--db",
         help="Path to the SQLite database persistence file.",
     ),
+    offline: bool = typer.Option(
+        False,
+        "--offline",
+        help="Execute in hermetic offline mode using mock sandbox and LLM adapters (no Docker or external APIs).",
+    ),
 ) -> None:
     """Executes a new pipeline run or resumes an interrupted run."""
     if resume is not None:
-        _execute_resume(run_id=resume, db_path=db)
+        _execute_resume(run_id=resume, db_path=db, offline=offline)
     elif repo is not None:
-        _execute_new_run(repo_path=repo, db_path=db)
+        _execute_new_run(repo_path=repo, db_path=db, offline=offline)
     else:
         print_error("Missing required parameter: Either --repo <path> or --resume <run_id> must be specified.")
         raise typer.Exit(code=2)
@@ -147,9 +224,14 @@ def resume_command(
         "--db",
         help="Path to the SQLite database persistence file.",
     ),
+    offline: bool = typer.Option(
+        False,
+        "--offline",
+        help="Resume in hermetic offline mode using mock sandbox and LLM adapters.",
+    ),
 ) -> None:
     """Subcommand to resume an interrupted workflow run by run_id."""
-    _execute_resume(run_id=run_id, db_path=db)
+    _execute_resume(run_id=run_id, db_path=db, offline=offline)
 
 
 def main() -> None:
