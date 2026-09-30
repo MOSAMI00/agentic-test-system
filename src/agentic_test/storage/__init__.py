@@ -8,9 +8,15 @@ from agentic_test.storage.database import (
     init_database,
     init_db,
 )
+from agentic_test.storage.events import (
+    EventRecord,
+    SQLiteEventStore,
+)
 
 __all__ = [
+    "EventRecord",
     "SCHEMA_DDL",
+    "SQLiteEventStore",
     "get_connection",
     "init_database",
     "init_db",
