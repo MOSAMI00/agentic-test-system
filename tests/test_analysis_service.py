@@ -452,3 +452,45 @@ def test_analysis_service_syntax_error_outside_diff_preserves_is_valid_true(tmp_
 
     # 4. Decision A: syntax error outside diff does NOT invalidate snapshot
     assert snapshot.is_valid is True
+
+
+def test_analysis_service_excludes_test_files_and_agentic_test_from_affected_symbols(
+    sample_git_repo: Path,
+) -> None:
+    """
+    Verifies that modifications to existing test files do NOT populate affected_symbols,
+    and files inside .agentic_test directory are strictly excluded from diffs and symbols.
+    """
+    # 1. Modify an existing test file
+    test_file = sample_git_repo / "tests" / "test_calc.py"
+    test_file.write_text(
+        "from pkg.calc import add\n\n"
+        "def test_add():\n"
+        "    assert add(1, 2) == 3\n\n"
+        "def test_add_extended():\n"
+        "    assert add(5, 5) == 10\n",
+        encoding="utf-8",
+    )
+
+    # 2. Add an untracked agentic_test candidate run directory
+    agentic_dir = sample_git_repo / ".agentic_test" / "runs" / "run-test123" / "candidates"
+    agentic_dir.mkdir(parents=True)
+    candidate_file = agentic_dir / "test_calc_candidate.py"
+    candidate_file.write_text(
+        "def test_candidate_func():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo)
+
+    # Affected symbols must NOT contain test functions from test_calc or .agentic_test
+    affected_names = [s.qualified_name for s in snapshot.affected_symbols]
+    assert "test_calc.test_add_extended" not in affected_names
+    assert not any("test_candidate_func" in name for name in affected_names)
+    assert not any(".agentic_test" in name for name in affected_names)
+
+    # Diff hunks must not contain .agentic_test
+    diff_file_paths = [h.file_path.as_posix() for h in snapshot.diff_hunks]
+    assert not any(".agentic_test" in p for p in diff_file_paths)
+

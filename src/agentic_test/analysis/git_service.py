@@ -23,6 +23,7 @@ from agentic_test.core.models import (
 # Standard directory names and file patterns excluded from static ingestion (FR-01, FR-02)
 EXCLUDED_DIR_NAMES: Set[str] = {
     ".git",
+    ".agentic_test",
     ".venv",
     "venv",
     "env",

@@ -79,13 +79,18 @@ class AnalysisService:
         diff_files = {hunk.file_path for hunk in diff_hunks}
         has_diff_syntax_error = False
 
-        # Internal analysis union: include tracked Python files and diff-added Python files
+        # Internal analysis union: include tracked Python files and diff-added Python files,
+        # strictly excluding existing test files from target symbol extraction.
+        existing_test_set = set(existing_test_files)
         diff_added_files = {
             hunk.file_path
             for hunk in diff_hunks
             if hunk.change_type == ChangeType.ADDED and hunk.file_path.suffix == ".py"
         }
-        analyzable_files = sorted(set(tracked_files) | diff_added_files)
+        analyzable_files = sorted(
+            f for f in (set(tracked_files) | diff_added_files)
+            if f not in existing_test_set
+        )
 
         # Traverse analyzable Python files and parse symbols statically
         for rel_path in analyzable_files:
