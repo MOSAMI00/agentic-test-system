@@ -126,11 +126,7 @@ def default_create_workflow_engine(
                 llm_service=mock_llm,
             )
     else:
-        # Live mode: Always construct ValidationPipeline with safe static validators
-        if validation_pipeline is None:
-            validation_pipeline = ValidationPipeline()
-
-        # In live mode, verify required live adapters or fail closed
+        # Live mode: Verify required live adapters or fail closed
         if generation_service is None:
             openai_key = (
                 settings.openai_api_key.get_secret_value()
@@ -202,7 +198,8 @@ def default_create_workflow_engine(
             if diagnosis_service is None:
                 diagnosis_service = DiagnosisService(llm_service=live_llm)
 
-        if execution_service is None:
+        docker_mgr = getattr(execution_service, "_sandbox_manager", None)
+        if docker_mgr is None and (execution_service is None or validation_pipeline is None):
             from agentic_test.execution.docker_sandbox import is_docker_sdk_available
             if not is_docker_sdk_available():
                 raise ConfigurationError(
@@ -219,6 +216,14 @@ def default_create_workflow_engine(
                     "Ensure Docker is running or run with --offline for local deterministic execution."
                 ) from err
 
+        # Live mode: Always construct ValidationPipeline with containerized Gate 3 collection screening
+        if validation_pipeline is None:
+            validation_pipeline = ValidationPipeline(
+                sandbox_manager=docker_mgr,
+                source_root=repo_path,
+            )
+
+        if execution_service is None:
             execution_service = ExecutionService(
                 sandbox_manager=docker_mgr,
                 source_root=repo_path or Path("."),

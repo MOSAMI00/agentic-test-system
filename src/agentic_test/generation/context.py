@@ -18,6 +18,7 @@ DEFAULT_MAX_TOKEN_BUDGET: int = 4000
 SYSTEM_INSTRUCTION: str = (
     "You are an expert Python test engineer generating robust, isolated pytest unit tests. "
     "Adhere strictly to standard pytest conventions. Use unittest.mock or in-memory fixtures. "
+    "Each item in 'imports' must be a valid, complete Python import statement starting with 'import ' or 'from '. "
     "Never generate direct filesystem write operations, shell commands, or network calls. "
     "Output must conform strictly to the required structured schema."
 )

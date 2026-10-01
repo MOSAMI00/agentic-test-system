@@ -27,7 +27,10 @@ class CandidateSynthesisSchema(BaseModel):
 
     imports: Tuple[str, ...] = Field(
         default_factory=tuple,
-        description="Explicit import statements required by the test function(s)."
+        description=(
+            "Explicit, complete Python import statements required by the test (e.g., 'import pytest', "
+            "'from slugify import special'). Do NOT output bare module names."
+        ),
     )
     test_code: str = Field(
         description="Synthesized pytest test function(s) implementing unit test cases."
