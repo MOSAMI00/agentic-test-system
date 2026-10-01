@@ -213,7 +213,13 @@ def diagnose_failure_node(
 
 def report_node(state: WorkflowState) -> WorkflowState:
     """
-    Finalizes workflow run status.
+    Finalizes workflow run status and exports run artifacts.
     Sets final_status to 'COMPLETED' while preserving all existing state data.
     """
-    return state.model_copy(update={"final_status": "COMPLETED"})
+    completed_state = state.model_copy(update={"final_status": "COMPLETED"})
+    try:
+        from agentic_test.reporting.exporter import export_run_artifacts
+        export_run_artifacts(completed_state)
+    except Exception:
+        pass
+    return completed_state

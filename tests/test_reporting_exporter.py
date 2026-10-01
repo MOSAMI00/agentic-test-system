@@ -1,0 +1,213 @@
+"""
+Unit tests for run artifact exporter and execution report generator.
+"""
+
+from pathlib import Path
+import pytest
+
+from agentic_test.core.models import (
+    ExecutionEvidence,
+    ExecutionPlan,
+    FailureCategory,
+    FailureDiagnosis,
+    RepositorySnapshot,
+    SymbolContract,
+    SymbolType,
+    TestCandidate,
+    TriageEngine,
+    ValidationStatus,
+    WorkflowRoute,
+)
+from agentic_test.core.state import WorkflowState
+from agentic_test.reporting.exporter import export_run_artifacts, sanitize_identifier
+
+
+def test_sanitize_identifier() -> None:
+    assert sanitize_identifier("slugify.special.reverse_char_mapping") == "slugify_special_reverse_char_mapping"
+    assert sanitize_identifier("func-name!123") == "func_name_123"
+    assert sanitize_identifier("___already_clean___") == "already_clean"
+
+
+def test_export_run_artifacts_success(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "mock_repo"
+    repo_dir.mkdir()
+
+    sym = SymbolContract(
+        symbol_type=SymbolType.FUNCTION,
+        name="calc_sum",
+        qualified_name="math_module.calc_sum",
+        file_path=Path("math_module.py"),
+        signature="calc_sum(a: int, b: int) -> int",
+        docstring="Adds two numbers.",
+        line_range=(1, 10),
+    )
+    plan = ExecutionPlan(
+        plan_id="plan-1",
+        route=WorkflowRoute.ROUTE_TO_TEST_GENERATION,
+        target_symbols=(sym,),
+        rationale="Plan rationale",
+        decision_hash="hash1",
+    )
+    cand1 = TestCandidate(
+        candidate_id="tc-1",
+        run_id="run-test-123",
+        target_symbol_name="math_module.calc_sum",
+        test_file_path=Path("tests/test_calc.py"),
+        candidate_code="def test_calc_sum(): assert calc_sum(1, 2) == 3",
+        imports=("import pytest", "from math_module import calc_sum"),
+        validation_status=ValidationStatus.PASSED,
+    )
+    cand2 = TestCandidate(
+        candidate_id="tc-2",
+        run_id="run-test-123",
+        target_symbol_name="math_module.calc_sum",
+        test_file_path=Path("tests/test_calc.py"),
+        candidate_code="def test_calc_fail(): assert calc_sum(1, 2) == 4",
+        imports=("import pytest", "from math_module import calc_sum"),
+        validation_status=ValidationStatus.PASSED,
+    )
+    ev1 = ExecutionEvidence(
+        evidence_id="ev-1",
+        run_id="run-test-123",
+        candidate_id="tc-1",
+        exit_code=0,
+        stdout="1 passed in 0.1s",
+        stderr="",
+        duration_sec=0.15,
+        line_coverage=85.0,
+        branch_coverage=75.0,
+        line_coverage_delta=5.0,
+        branch_coverage_delta=2.5,
+    )
+    ev2 = ExecutionEvidence(
+        evidence_id="ev-2",
+        run_id="run-test-123",
+        candidate_id="tc-2",
+        exit_code=1,
+        stdout="",
+        stderr="",
+        traceback="def test_calc_fail(): > assert calc_sum(1, 2) == 4\nE AssertionError",
+        duration_sec=0.20,
+    )
+    diag = FailureDiagnosis(
+        diagnosis_id="diag-1",
+        evidence_id="ev-2",
+        canonical_category=FailureCategory.INVALID_GENERATED_TEST,
+        confidence=0.95,
+        triage_engine=TriageEngine.COGNITIVE_LLM,
+        explanation="The test expects 4 instead of 3, making it an invalid test assertion.",
+        is_application_bug=False,
+    )
+
+    state = WorkflowState(
+        run_id="run-test-123",
+        repo_path=repo_dir,
+        plan=plan,
+        candidates=(cand1, cand2),
+        evidences=(ev1, ev2),
+        diagnoses=(diag,),
+        final_status="COMPLETED",
+    )
+
+    run_dir = export_run_artifacts(state)
+    assert run_dir is not None
+    assert run_dir.exists()
+
+    expected_dir = repo_dir / ".agentic_test" / "runs" / "run-test-123"
+    assert run_dir == expected_dir
+
+    candidates_dir = run_dir / "candidates"
+    assert candidates_dir.exists()
+
+    # Check candidate 1 file
+    f1 = candidates_dir / "test_math_module_calc_sum_tc-1.py"
+    assert f1.exists()
+    content1 = f1.read_text(encoding="utf-8")
+    assert "import pytest" in content1
+    assert "from math_module import calc_sum" in content1
+    assert "def test_calc_sum(): assert calc_sum(1, 2) == 3" in content1
+    assert "Run ID:            run-test-123" in content1
+
+    # Check candidate 2 file
+    f2 = candidates_dir / "test_math_module_calc_sum_tc-2.py"
+    assert f2.exists()
+    content2 = f2.read_text(encoding="utf-8")
+    assert "def test_calc_fail(): assert calc_sum(1, 2) == 4" in content2
+
+    # Check report.md
+    report_file = run_dir / "report.md"
+    assert report_file.exists()
+    report_text = report_file.read_text(encoding="utf-8")
+
+    assert "# Execution Report: `run-test-123`" in report_text
+    assert "Executive Summary" in report_text
+    assert "Process Errors & Diagnostics Alerts" in report_text
+    assert "Execution Failures & Traceback Snippets" in report_text
+    assert "Candidate `tc-2`" in report_text
+    assert "AssertionError" in report_text
+    assert "Failure Diagnoses & Triage Details" in report_text
+    assert "The test expects 4 instead of 3" in report_text
+    assert "Coverage Telemetry & Deltas" in report_text
+    assert "85.0%" in report_text
+
+
+def test_export_run_artifacts_with_quarantine_and_app_bug(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "app_bug_repo"
+    repo_dir.mkdir()
+
+    cand = TestCandidate(
+        candidate_id="tc-quarantined",
+        run_id="run-bug-456",
+        target_symbol_name="broken_sym",
+        test_file_path=Path("test.py"),
+        candidate_code="",
+        validation_status=ValidationStatus.QUARANTINED,
+        quarantine_reason="EXHAUSTED_GENERATION_REPAIRS",
+    )
+    ev = ExecutionEvidence(
+        evidence_id="ev-bug",
+        run_id="run-bug-456",
+        candidate_id=None,
+        exit_code=1,
+        stdout="",
+        stderr="MemoryError",
+        duration_sec=1.5,
+    )
+    diag = FailureDiagnosis(
+        diagnosis_id="diag-app-bug",
+        evidence_id="ev-bug",
+        canonical_category=FailureCategory.APPLICATION_BUG,
+        confidence=0.92,
+        triage_engine=TriageEngine.COGNITIVE_LLM,
+        explanation="Detected genuine memory leak defect in target application.",
+        is_application_bug=True,
+    )
+
+    state = WorkflowState(
+        run_id="run-bug-456",
+        repo_path=repo_dir,
+        candidates=(cand,),
+        evidences=(ev,),
+        diagnoses=(diag,),
+        final_status="COMPLETED",
+        error_message="Global pipeline warning",
+    )
+
+    run_dir = export_run_artifacts(state)
+    assert run_dir is not None
+
+    report_text = (run_dir / "report.md").read_text(encoding="utf-8")
+    assert "CRITICAL: APPLICATION DEFECT DETECTED" in report_text
+    assert "Detected genuine memory leak defect" in report_text
+    assert "Global pipeline warning" in report_text
+    assert "EXHAUSTED_GENERATION_REPAIRS" in report_text
+
+
+def test_export_run_artifacts_graceful_on_invalid_repo() -> None:
+    state = WorkflowState(
+        run_id="run-invalid",
+        repo_path=Path("/non_existent_directory_987654321"),
+        final_status="COMPLETED",
+    )
+    result = export_run_artifacts(state)
+    assert result is None
