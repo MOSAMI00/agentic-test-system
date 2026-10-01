@@ -104,6 +104,7 @@ def _generate_report_markdown(
     ev_map: Dict[str, ExecutionEvidence] = {
         ev.candidate_id: ev for ev in state.evidences if ev.candidate_id
     }
+    file_name_by_cand = {cand.candidate_id: fn for fn, _, cand in exported_files}
 
     lines = [
         f"# Execution Report: `{state.run_id}`",
@@ -129,11 +130,37 @@ def _generate_report_markdown(
         "",
         "---",
         "",
-        "## 2. Process Errors & Diagnostics Alerts",
+        "## 2. Exported Test Candidate Files",
         "",
     ]
 
-    # Collect all errors that surfaced during the pipeline
+    # 2. Exported Candidates List (Placed immediately after Executive Summary)
+    if exported_files:
+        lines.append("The following runnable test candidate files were generated and saved:")
+        for fn, fp, c in exported_files:
+            ev = ev_map.get(c.candidate_id)
+            status_parts = []
+            if ev is not None:
+                status_parts.append(f"Exit Code: `{ev.exit_code}`")
+                status_parts.append(f"Duration: `{ev.duration_sec:.2f}s`")
+                if ev.timed_out or ev.exit_code == 124:
+                    status_parts.append("**TIMED OUT**")
+            else:
+                status_parts.append("Status: " + c.validation_status.value)
+            status_desc = ", ".join(status_parts)
+            lines.append(f"- [`candidates/{fn}`](./candidates/{fn}) — Target: `{c.target_symbol_name}` ({status_desc})")
+    else:
+        lines.append("No executable test candidate files were exported for this run.")
+    lines.append("")
+
+    # 3. Process Errors & Diagnostics Alerts
+    lines.extend([
+        "---",
+        "",
+        "## 3. Process Errors & Diagnostics Alerts",
+        "",
+    ])
+
     errors_found = False
 
     # A. Global error message
@@ -194,8 +221,9 @@ def _generate_report_markdown(
         ])
         for ev in failed_evidences:
             cand_id = ev.candidate_id or "unknown"
+            to_str = " (TIMED OUT)" if (ev.timed_out or ev.exit_code == 124) else ""
             lines.extend([
-                f"#### Candidate `{cand_id}` (Exit Code: `{ev.exit_code}`, Duration: `{ev.duration_sec:.2f}s`)",
+                f"#### Candidate `{cand_id}` (Exit Code: `{ev.exit_code}`{to_str}, Duration: `{ev.duration_sec:.2f}s`)",
                 "",
             ])
             if ev.traceback:
@@ -213,7 +241,6 @@ def _generate_report_markdown(
                     "",
                 ])
             elif ev.stdout:
-                # Extract failed assertion line if present
                 lines.extend([
                     "```text",
                     ev.stdout.strip()[:1000],
@@ -228,80 +255,85 @@ def _generate_report_markdown(
             "",
         ])
 
-    # 3. Test Candidates Table
+    # 4. Test Candidates Table (with clickable file links and Timed Out column)
     lines.extend([
         "---",
         "",
-        "## 3. Test Candidates & Validation Status",
+        "## 4. Test Candidates & Validation Status",
         "",
-        "| Candidate ID | Target Symbol | Validation Status | Details / Reason | Exit Code | Duration | File Name |",
-        "| :--- | :--- | :--- | :--- | :---: | :---: | :--- |",
+        "| Candidate ID | Target Symbol | Validation Status | Details / Reason | Exit Code | Timed Out? | Duration | File Link |",
+        "| :--- | :--- | :--- | :--- | :---: | :---: | :---: | :--- |",
     ])
 
-    file_name_by_cand = {cand.candidate_id: fn for fn, _, cand in exported_files}
     for c in state.candidates:
         ev = ev_map.get(c.candidate_id)
         exit_code_str = str(ev.exit_code) if ev is not None else "-"
+        timed_out_str = "**YES**" if (ev is not None and (ev.timed_out or ev.exit_code == 124)) else ("No" if ev is not None else "-")
         dur_str = f"{ev.duration_sec:.2f}s" if ev is not None else "-"
-        fn_str = f"`candidates/{file_name_by_cand.get(c.candidate_id)}`" if c.candidate_id in file_name_by_cand else "-"
+        if c.candidate_id in file_name_by_cand:
+            fn = file_name_by_cand[c.candidate_id]
+            fn_str = f"[`candidates/{fn}`](./candidates/{fn})"
+        else:
+            fn_str = "-"
         reason_str = c.quarantine_reason or "-"
 
         lines.append(
-            f"| `{c.candidate_id}` | `{c.target_symbol_name}` | `{c.validation_status.value}` | {reason_str} | {exit_code_str} | {dur_str} | {fn_str} |"
+            f"| `{c.candidate_id}` | `{c.target_symbol_name}` | `{c.validation_status.value}` | {reason_str} | {exit_code_str} | {timed_out_str} | {dur_str} | {fn_str} |"
         )
     lines.append("")
 
-    # 4. Coverage Telemetry
+    # 5. Coverage Telemetry & Deltas (including Baseline Regression)
+    has_baseline_cov = state.baseline_evidence is not None and (
+        state.baseline_evidence.line_coverage is not None or state.baseline_evidence.branch_coverage is not None
+    )
     cov_evidences = [ev for ev in state.evidences if ev.line_coverage is not None or ev.line_coverage_delta is not None]
-    if cov_evidences:
+
+    if has_baseline_cov or cov_evidences:
         lines.extend([
             "---",
             "",
-            "## 4. Coverage Telemetry & Deltas",
+            "## 5. Coverage Telemetry & Deltas",
             "",
-            "| Candidate ID | Line Cov | Line Delta | Branch Cov | Branch Delta |",
-            "| :--- | :---: | :---: | :---: | :---: |",
+            "| Target / Candidate | Line Cov | Line Delta | Branch Cov | Branch Delta | Exit Code | Duration |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
         ])
+
+        # Add Baseline row first if present
+        if has_baseline_cov and state.baseline_evidence is not None:
+            base = state.baseline_evidence
+            b_line = f"{base.line_coverage:.1f}%" if base.line_coverage is not None else "-"
+            b_branch = f"{base.branch_coverage:.1f}%" if base.branch_coverage is not None else "-"
+            lines.append(
+                f"| **Baseline** (Existing Tests) | {b_line} | - | {b_branch} | - | `{base.exit_code}` | {base.duration_sec:.2f}s |"
+            )
+
+        # Add Candidates coverage rows
         for ev in cov_evidences:
             line_str = f"{ev.line_coverage:.1f}%" if ev.line_coverage is not None else "-"
             l_delta = f"{ev.line_coverage_delta:+.1f}%" if ev.line_coverage_delta is not None else "-"
             branch_str = f"{ev.branch_coverage:.1f}%" if ev.branch_coverage is not None else "-"
             b_delta = f"{ev.branch_coverage_delta:+.1f}%" if ev.branch_coverage_delta is not None else "-"
-            lines.append(f"| `{ev.candidate_id or 'baseline'}` | {line_str} | {l_delta} | {branch_str} | {b_delta} |")
+            exit_str = f"`{ev.exit_code}`"
+            dur_str = f"{ev.duration_sec:.2f}s"
+            lines.append(f"| `{ev.candidate_id or 'unknown'}` | {line_str} | {l_delta} | {branch_str} | {b_delta} | {exit_str} | {dur_str} |")
         lines.append("")
 
-    # 5. Failure Diagnoses Table
+    # 6. Failure Diagnoses Table (with Category & Confidence highlighted clearly)
     if state.diagnoses:
         lines.extend([
             "---",
             "",
-            "## 5. Failure Diagnoses & Triage Details",
+            "## 6. Failure Diagnoses & Triage Details",
             "",
             "| Diagnosis ID | Evidence ID | Category | Confidence | Engine | Is App Bug? | Explanation |",
             "| :--- | :--- | :--- | :---: | :--- | :---: | :--- |",
         ])
         for d in state.diagnoses:
             bug_flag = "**YES**" if d.is_application_bug else "No"
+            conf_str = f"`{d.confidence:.2f}` ({int(d.confidence * 100)}%)"
             lines.append(
-                f"| `{d.diagnosis_id}` | `{d.evidence_id}` | `{d.canonical_category.value}` | {d.confidence:.2f} | `{d.triage_engine.value}` | {bug_flag} | {d.explanation} |"
+                f"| `{d.diagnosis_id}` | `{d.evidence_id}` | `{d.canonical_category.value}` | {conf_str} | `{d.triage_engine.value}` | {bug_flag} | {d.explanation} |"
             )
         lines.append("")
-
-    # 6. Exported Candidates List
-    lines.extend([
-        "---",
-        "",
-        "## 6. Exported Candidate Files",
-        "",
-    ])
-    if exported_files:
-        lines.append("The following runnable test candidate files were generated and saved:")
-        for fn, fp, c in exported_files:
-            ev = ev_map.get(c.candidate_id)
-            exit_str = f"Exit Code: {ev.exit_code}" if ev is not None else "Not Executed"
-            lines.append(f"- [`candidates/{fn}`](./candidates/{fn}) — Target: `{c.target_symbol_name}` ({exit_str})")
-    else:
-        lines.append("No executable test candidate files were exported for this run.")
-    lines.append("")
 
     return "\n".join(lines)

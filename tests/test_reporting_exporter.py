@@ -99,11 +99,24 @@ def test_export_run_artifacts_success(tmp_path: Path) -> None:
         is_application_bug=False,
     )
 
+    base_ev = ExecutionEvidence(
+        evidence_id="ev-base",
+        run_id="run-test-123",
+        candidate_id=None,
+        exit_code=0,
+        stdout="all base tests passed",
+        stderr="",
+        duration_sec=0.50,
+        line_coverage=50.0,
+        branch_coverage=40.0,
+    )
+
     state = WorkflowState(
         run_id="run-test-123",
         repo_path=repo_dir,
         plan=plan,
         candidates=(cand1, cand2),
+        baseline_evidence=base_ev,
         evidences=(ev1, ev2),
         diagnoses=(diag,),
         final_status="COMPLETED",
@@ -141,14 +154,25 @@ def test_export_run_artifacts_success(tmp_path: Path) -> None:
 
     assert "# Execution Report: `run-test-123`" in report_text
     assert "Executive Summary" in report_text
+    # 1. Exported candidates placed right after executive summary
+    assert report_text.find("## 2. Exported Test Candidate Files") < report_text.find("## 3. Process Errors & Diagnostics Alerts")
+    # 2. Clickable link in candidates table
+    assert "[`candidates/test_math_module_calc_sum_tc-1.py`](./candidates/test_math_module_calc_sum_tc-1.py)" in report_text
+    # 3. Baseline regression included in coverage table
+    assert "**Baseline** (Existing Tests)" in report_text
+    assert "50.0%" in report_text
+    assert "Coverage Telemetry & Deltas" in report_text
+    assert "85.0%" in report_text
+    # 4. Timed Out column present
+    assert "Timed Out?" in report_text
+    # 5. Diagnoses shows category, engine, and confidence percentage
+    assert "Failure Diagnoses & Triage Details" in report_text
+    assert "The test expects 4 instead of 3" in report_text
+    assert "(95%)" in report_text
     assert "Process Errors & Diagnostics Alerts" in report_text
     assert "Execution Failures & Traceback Snippets" in report_text
     assert "Candidate `tc-2`" in report_text
     assert "AssertionError" in report_text
-    assert "Failure Diagnoses & Triage Details" in report_text
-    assert "The test expects 4 instead of 3" in report_text
-    assert "Coverage Telemetry & Deltas" in report_text
-    assert "85.0%" in report_text
 
 
 def test_export_run_artifacts_with_quarantine_and_app_bug(tmp_path: Path) -> None:
