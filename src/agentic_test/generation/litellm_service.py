@@ -89,7 +89,7 @@ class LiteLLMService(LLMService):
         else:
             self._api_key = api_key
         self._budget_tracker: RunBudgetTracker = (
-            budget_tracker if budget_tracker is not None else RunBudgetTracker(max_requests=5)
+            budget_tracker if budget_tracker is not None else RunBudgetTracker(max_requests=20)
         )
         self._max_retries: int = max_retries
         self._timeout: float = timeout

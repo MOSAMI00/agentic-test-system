@@ -1088,6 +1088,7 @@ def test_candidate_persistence_and_retrieval() -> None:
             target_symbol_name="calc_sum",
             test_file_path=Path("tests/test_calc.py"),
             candidate_code="def test_calc(): assert calc_sum(1, 2) == 3",
+            imports=("import pytest", "from calc import calc_sum"),
             validation_status=ValidationStatus.PASSED,
             retry_count=0,
             created_at=now,
@@ -1104,6 +1105,7 @@ def test_candidate_persistence_and_retrieval() -> None:
         assert retrieved.target_symbol_name == "calc_sum"
         assert retrieved.test_file_path == Path("tests/test_calc.py")
         assert retrieved.candidate_code == "def test_calc(): assert calc_sum(1, 2) == 3"
+        assert retrieved.imports == ("import pytest", "from calc import calc_sum")
         assert retrieved.validation_status == ValidationStatus.PASSED
         assert retrieved.quarantine_reason is None
         assert retrieved.retry_count == 0
@@ -1113,6 +1115,7 @@ def test_candidate_persistence_and_retrieval() -> None:
         cand_list = repo.get_candidates("run-1")
         assert len(cand_list) == 1
         assert cand_list[0].candidate_id == "cand-1"
+        assert cand_list[0].imports == ("import pytest", "from calc import calc_sum")
 
         # Update candidate status to QUARANTINED
         quarantined_cand = TestCandidate(

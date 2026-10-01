@@ -5,6 +5,7 @@ Adheres strictly to Stage 3 Section 4.4.7 (Listing 4.4) and Slice 1.6.2C contrac
 
 from datetime import datetime, timezone
 from enum import Enum
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any, List, Optional, Union
@@ -199,13 +200,14 @@ class SQLiteRepository:
         sql = """
         INSERT INTO test_candidates (
             candidate_id, run_id, target_symbol, test_file_path, candidate_code,
-            validation_status, quarantine_reason, retry_count, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            imports, validation_status, quarantine_reason, retry_count, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(candidate_id) DO UPDATE SET
             run_id = excluded.run_id,
             target_symbol = excluded.target_symbol,
             test_file_path = excluded.test_file_path,
             candidate_code = excluded.candidate_code,
+            imports = excluded.imports,
             validation_status = excluded.validation_status,
             quarantine_reason = excluded.quarantine_reason,
             retry_count = excluded.retry_count,
@@ -219,6 +221,7 @@ class SQLiteRepository:
                 candidate.target_symbol_name,
                 str(candidate.test_file_path),
                 candidate.candidate_code,
+                json.dumps(list(candidate.imports)),
                 candidate.validation_status.value
                 if isinstance(candidate.validation_status, Enum)
                 else str(candidate.validation_status),
@@ -238,7 +241,7 @@ class SQLiteRepository:
         cursor = self._conn.execute(
             """
             SELECT candidate_id, run_id, target_symbol, test_file_path, candidate_code,
-                   validation_status, quarantine_reason, retry_count, created_at
+                   imports, validation_status, quarantine_reason, retry_count, created_at
             FROM test_candidates
             WHERE candidate_id = ?;
             """,
@@ -248,12 +251,16 @@ class SQLiteRepository:
         if row is None:
             return None
 
+        imports_raw = row["imports"] if "imports" in row.keys() else None
+        imports_tuple = tuple(json.loads(imports_raw)) if imports_raw else ()
+
         return TestCandidate(
             candidate_id=row["candidate_id"],
             run_id=row["run_id"],
             target_symbol_name=row["target_symbol"],
             test_file_path=Path(row["test_file_path"]),
             candidate_code=row["candidate_code"],
+            imports=imports_tuple,
             validation_status=ValidationStatus(row["validation_status"]),
             quarantine_reason=row["quarantine_reason"],
             retry_count=int(row["retry_count"]),
@@ -268,7 +275,7 @@ class SQLiteRepository:
         cursor = self._conn.execute(
             """
             SELECT candidate_id, run_id, target_symbol, test_file_path, candidate_code,
-                   validation_status, quarantine_reason, retry_count, created_at
+                   imports, validation_status, quarantine_reason, retry_count, created_at
             FROM test_candidates
             WHERE run_id = ?
             ORDER BY created_at ASC, candidate_id ASC;
@@ -277,6 +284,8 @@ class SQLiteRepository:
         )
         candidates: List[TestCandidate] = []
         for row in cursor.fetchall():
+            imports_raw = row["imports"] if "imports" in row.keys() else None
+            imports_tuple = tuple(json.loads(imports_raw)) if imports_raw else ()
             candidates.append(
                 TestCandidate(
                     candidate_id=row["candidate_id"],
@@ -284,6 +293,7 @@ class SQLiteRepository:
                     target_symbol_name=row["target_symbol"],
                     test_file_path=Path(row["test_file_path"]),
                     candidate_code=row["candidate_code"],
+                    imports=imports_tuple,
                     validation_status=ValidationStatus(row["validation_status"]),
                     quarantine_reason=row["quarantine_reason"],
                     retry_count=int(row["retry_count"]),

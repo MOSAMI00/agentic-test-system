@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS test_candidates (
     target_symbol TEXT NOT NULL,
     test_file_path TEXT NOT NULL,
     candidate_code TEXT NOT NULL,
+    imports TEXT DEFAULT '[]',
     validation_status TEXT NOT NULL,
     quarantine_reason TEXT,
     retry_count INTEGER DEFAULT 0,
@@ -157,6 +158,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     Safe to execute multiple times on an already initialized or populated database.
     """
     conn.executescript(SCHEMA_DDL)
+    # Ensure backward compatibility for existing databases: check if imports column exists
+    cursor = conn.execute("PRAGMA table_info(test_candidates);")
+    columns = [row["name"] for row in cursor.fetchall()]
+    if columns and "imports" not in columns:
+        conn.execute("ALTER TABLE test_candidates ADD COLUMN imports TEXT DEFAULT '[]';")
 
 
 def init_database(db_path: Union[str, Path] = ":memory:") -> sqlite3.Connection:
