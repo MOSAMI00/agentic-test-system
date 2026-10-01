@@ -80,7 +80,7 @@ class AnalysisService:
         has_diff_syntax_error = False
 
         # Internal analysis union: include tracked Python files and diff-added Python files,
-        # strictly excluding existing test files from target symbol extraction.
+        # strictly excluding test files from target symbol extraction.
         existing_test_set = set(existing_test_files)
         diff_added_files = {
             hunk.file_path
@@ -89,7 +89,7 @@ class AnalysisService:
         }
         analyzable_files = sorted(
             f for f in (set(tracked_files) | diff_added_files)
-            if f not in existing_test_set
+            if not self._is_test_file(f, existing_test_set)
         )
 
         # Traverse analyzable Python files and parse symbols statically
@@ -122,16 +122,19 @@ class AnalysisService:
         affected_symbols = analyzer.resolve_affected_symbols(all_symbols, diff_hunks)
 
         # Baseline AST reconciliation for deleted callable symbols (Decision B)
+        # Apply the exact same test file exclusion policy so modified/deleted tests
+        # are not treated as deleted target application symbols.
         deleted_symbols: List[SymbolContract] = []
         files_with_deletions = {
             hunk.file_path
             for hunk in diff_hunks
-            if hunk.old_lines > 0 or hunk.change_type in (ChangeType.MODIFIED, ChangeType.DELETED)
+            if (hunk.old_lines > 0 or hunk.change_type in (ChangeType.MODIFIED, ChangeType.DELETED))
+            and not self._is_test_file(hunk.file_path, existing_test_set)
         }
         surviving_qualnames = {s.qualified_name for s in all_symbols}
 
         for rel_path in sorted(files_with_deletions):
-            if rel_path.suffix != ".py":
+            if rel_path.suffix != ".py" or self._is_test_file(rel_path, existing_test_set):
                 continue
 
             try:
@@ -209,3 +212,21 @@ class AnalysisService:
             if p_posix == df_posix or p_posix.endswith("/" + df_posix) or df_posix.endswith("/" + p_posix):
                 return True
         return False
+
+    @staticmethod
+    def _is_test_file(file_path: Path, existing_tests: Set[Path]) -> bool:
+        """
+        Determines whether file_path represents a test file to exclude from target symbol analysis.
+        Matches pytest conventions (test_*.py, *_test.py) and existing test file references.
+        """
+        if file_path in existing_tests:
+            return True
+        if file_path.suffix == ".py" and (file_path.name.startswith("test_") or file_path.name.endswith("_test.py")):
+            return True
+        p_posix = file_path.as_posix()
+        for et in existing_tests:
+            et_posix = et.as_posix()
+            if p_posix == et_posix or p_posix.endswith("/" + et_posix) or et_posix.endswith("/" + p_posix):
+                return True
+        return False
+

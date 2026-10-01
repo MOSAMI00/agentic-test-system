@@ -494,3 +494,51 @@ def test_analysis_service_excludes_test_files_and_agentic_test_from_affected_sym
     diff_file_paths = [h.file_path.as_posix() for h in snapshot.diff_hunks]
     assert not any(".agentic_test" in p for p in diff_file_paths)
 
+
+def test_modifying_test_function_without_deletion_is_absent_from_affected_and_deleted_symbols(
+    sample_git_repo: Path,
+) -> None:
+    """
+    Verifies that modifying an existing test function without deleting it preserves diff hunks,
+    while strictly excluding the test function from both affected_symbols and deleted_symbols.
+    Simultaneously verifies that genuine application code deletions in the same commit diff
+    are still accurately captured in deleted_symbols.
+    """
+    # 1. Baseline repo has tests/test_calc.py with def test_add(): assert add(1, 2) == 3
+    # Modify test_add in-place (do not delete the function)
+    test_file = sample_git_repo / "tests" / "test_calc.py"
+    test_file.write_text(
+        "from pkg.calc import add\n\n"
+        "def test_add():\n"
+        "    assert add(1, 2) == 3\n"
+        "    assert add(10, 20) == 30\n",
+        encoding="utf-8",
+    )
+
+    # 2. Concurrently delete an actual application callable 'multiply' from src/pkg/calc.py
+    calc_file = sample_git_repo / "src" / "pkg" / "calc.py"
+    calc_file.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo)
+
+    # 3. Diff hunks must capture both changes
+    hunk_files = {h.file_path.as_posix() for h in snapshot.diff_hunks}
+    assert any("test_calc.py" in f for f in hunk_files)
+    assert any("calc.py" in f for f in hunk_files)
+
+    # 4. affected_symbols must NOT contain any test symbols
+    affected_names = [s.qualified_name for s in snapshot.affected_symbols]
+    assert not any("test" in name.lower() for name in affected_names)
+    assert "pkg.calc.add" not in affected_names
+
+    # 5. deleted_symbols must strictly exclude test_add, but accurately include pkg.calc.multiply
+    deleted_names = [s.qualified_name for s in snapshot.deleted_symbols]
+    assert not any("test" in name.lower() for name in deleted_names)
+    assert "pkg.calc.multiply" in deleted_names
+
+
