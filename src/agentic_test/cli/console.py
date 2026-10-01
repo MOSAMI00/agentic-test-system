@@ -84,7 +84,7 @@ def print_workflow_summary(
 
     # 1. Status Overview Table
     overview = Table(title="Execution Summary", border_style="cyan", show_header=True)
-    overview.add_column("Property", style="bold cyan")
+    overview.add_column("Property", style="bold cyan", no_wrap=True)
     overview.add_column("Value")
 
     status_color = "green" if state.final_status == "COMPLETED" else "red"
@@ -93,7 +93,16 @@ def print_workflow_summary(
 
     num_symbols = len(state.plan.target_symbols) if state.plan else 0
     overview.add_row("Target Symbols", str(num_symbols))
-    overview.add_row("Generated Candidates", str(len(state.candidates)))
+
+    synthesized_count = sum(
+        1 for c in state.candidates if c.candidate_code and c.candidate_code.strip()
+    )
+    failed_gen_count = len(state.candidates) - synthesized_count
+    if failed_gen_count > 0:
+        cand_str = f"{synthesized_count} [dim]({failed_gen_count} failed in generation)[/dim]"
+    else:
+        cand_str = str(len(state.candidates))
+    overview.add_row("Generated Candidates", cand_str)
     overview.add_row("Execution Evidences", str(len(state.evidences)))
     overview.add_row("Failure Diagnoses", str(len(state.diagnoses)))
 
@@ -101,12 +110,18 @@ def print_workflow_summary(
 
     # 2. Candidates Table (if candidates exist)
     if state.candidates:
-        cand_table = Table(title="Test Candidates & Validation Status", border_style="blue")
-        cand_table.add_column("Candidate ID", style="bold")
-        cand_table.add_column("Target Symbol")
-        cand_table.add_column("Validation Status")
-        cand_table.add_column("Exit Code", justify="right")
-        cand_table.add_column("Duration", justify="right")
+        cand_table = Table(
+            title="Test Candidates & Validation Status",
+            border_style="blue",
+            expand=True,
+            show_lines=True,
+        )
+        cand_table.add_column("Candidate ID", style="bold", no_wrap=True)
+        cand_table.add_column("Target Symbol", ratio=3, overflow="fold")
+        cand_table.add_column("Validation Status", no_wrap=True)
+        cand_table.add_column("Details / Reason", ratio=2, overflow="fold")
+        cand_table.add_column("Exit", justify="center", no_wrap=True)
+        cand_table.add_column("Duration", justify="right", no_wrap=True)
 
         # Map evidences by candidate_id
         ev_map = {ev.candidate_id: ev for ev in state.evidences if ev.candidate_id}
@@ -121,13 +136,36 @@ def print_workflow_summary(
                 else "red"
             )
 
+            status_text = f"[{status_style}]{cand.validation_status.value}[/{status_style}]"
+
+            if cand.quarantine_reason:
+                if cand.quarantine_reason == "EXHAUSTED_GENERATION_REPAIRS":
+                    reason_str = (
+                        "Gen Failed (Repairs Exhausted)"
+                        if not (cand.candidate_code and cand.candidate_code.strip())
+                        else "Repairs Exhausted"
+                    )
+                elif cand.quarantine_reason.startswith("CONTEXT_BUDGET_EXCEEDED"):
+                    reason_str = "Context Budget Exceeded"
+                else:
+                    reason_str = cand.quarantine_reason
+            elif cand.validation_status == ValidationStatus.REJECTED_SYNTAX:
+                reason_str = "Gate 1 Syntax Violation"
+            elif cand.validation_status == ValidationStatus.REJECTED_SECURITY:
+                reason_str = "Gate 2 Security Violation"
+            elif cand.validation_status == ValidationStatus.REJECTED_COLLECTION:
+                reason_str = "Gate 3 Collection Failure"
+            else:
+                reason_str = "-"
+
             exit_str = str(ev.exit_code) if ev is not None else "-"
             dur_str = f"{ev.duration_sec:.2f}s" if ev is not None else "-"
 
             cand_table.add_row(
                 cand.candidate_id,
                 cand.target_symbol_name,
-                f"[{status_style}]{cand.validation_status.value}[/{status_style}]",
+                status_text,
+                reason_str,
                 exit_str,
                 dur_str,
             )
@@ -138,10 +176,10 @@ def print_workflow_summary(
     if state.baseline_evidence is not None:
         base_ev = state.baseline_evidence
         b_table = Table(title="Regression Baseline Telemetry", border_style="magenta")
-        b_table.add_column("Exit Code", justify="right")
-        b_table.add_column("Duration", justify="right")
-        b_table.add_column("Line Cov", justify="right")
-        b_table.add_column("Branch Cov", justify="right")
+        b_table.add_column("Exit Code", justify="center", no_wrap=True)
+        b_table.add_column("Duration", justify="right", no_wrap=True)
+        b_table.add_column("Line Cov", justify="right", no_wrap=True)
+        b_table.add_column("Branch Cov", justify="right", no_wrap=True)
 
         line_str = f"{base_ev.line_coverage:.1f}%" if base_ev.line_coverage is not None else "-"
         branch_str = f"{base_ev.branch_coverage:.1f}%" if base_ev.branch_coverage is not None else "-"
@@ -158,11 +196,11 @@ def print_workflow_summary(
     cov_evidences = [ev for ev in state.evidences if ev.line_coverage_delta is not None or ev.line_coverage is not None]
     if cov_evidences:
         cov_table = Table(title="Coverage Telemetry & Deltas", border_style="green")
-        cov_table.add_column("Candidate ID", style="bold")
-        cov_table.add_column("Line Cov", justify="right")
-        cov_table.add_column("Line Delta", justify="right")
-        cov_table.add_column("Branch Cov", justify="right")
-        cov_table.add_column("Branch Delta", justify="right")
+        cov_table.add_column("Candidate ID", style="bold", no_wrap=True)
+        cov_table.add_column("Line Cov", justify="right", no_wrap=True)
+        cov_table.add_column("Line Delta", justify="right", no_wrap=True)
+        cov_table.add_column("Branch Cov", justify="right", no_wrap=True)
+        cov_table.add_column("Branch Delta", justify="right", no_wrap=True)
 
         for ev in cov_evidences:
             line_str = f"{ev.line_coverage:.1f}%" if ev.line_coverage is not None else "-"
@@ -183,12 +221,12 @@ def print_workflow_summary(
     # 5. Diagnoses (if any)
     if state.diagnoses:
         diag_table = Table(title="Failure Diagnoses & Triage", border_style="red")
-        diag_table.add_column("Diagnosis ID", style="bold")
-        diag_table.add_column("Evidence ID")
-        diag_table.add_column("Category")
-        diag_table.add_column("Engine")
-        diag_table.add_column("Confidence", justify="right")
-        diag_table.add_column("Is Bug?", justify="center")
+        diag_table.add_column("Diagnosis ID", style="bold", no_wrap=True)
+        diag_table.add_column("Evidence ID", no_wrap=True)
+        diag_table.add_column("Category", no_wrap=True)
+        diag_table.add_column("Engine", no_wrap=True)
+        diag_table.add_column("Confidence", justify="right", no_wrap=True)
+        diag_table.add_column("Is Bug?", justify="center", no_wrap=True)
 
         for diag in state.diagnoses:
             cat_color = "red" if diag.canonical_category == FailureCategory.APPLICATION_BUG else "yellow"
