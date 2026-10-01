@@ -267,6 +267,63 @@ def apply_scenario_6(repo: Path) -> None:
     )
 
 
+def apply_scenario_7(repo: Path) -> None:
+    """
+    Scenario 7: Combined Mega-PR (New Symbols + Covered Changes + Doc Updates)
+    Simulates a comprehensive real-world pull request containing:
+      1. Documentation update to README.md (Normally Rule P2 -> ROUTE_NO_OP).
+      2. Safe internal optimization in existing covered 'add_uppercase_char' (Normally Rule P3 -> ROUTE_TO_DOCKER_EXECUTION).
+      3. New uncovered function 'extract_language_chars' requiring test synthesis (Rule P4 / Rule P1 Priority).
+    Expected:
+      - Selected Route: ROUTE_TO_TEST_GENERATION (Priority Rule P1 overrides P2 and P3)
+      - LLM Action: Gemini synthesizes test candidates for uncovered 'extract_language_chars'
+      - Docker Action: Executes both synthesized tests and existing regression tests
+      - Final Status: COMPLETED
+    """
+    reset_repo(repo)
+    # 1. Update documentation
+    readme = repo / README_REL
+    if readme.exists():
+        content = readme.read_text(encoding="utf-8")
+        readme.write_text(content + "\n<!-- Feature PR: Added language char extraction utilities and safe optimizations -->\n", encoding="utf-8")
+
+    # 2. Modify slugify/special.py: safe internal optimization to add_uppercase_char + new uncovered function
+    base_content = get_base_special_content(repo)
+    modified_content = base_content.replace(
+        "    insertions = []",
+        "    # Safe internal optimization: pre-allocated typed list\n    insertions: list[tuple[str, str]] = []",
+    )
+    new_func = (
+        "\n\ndef extract_language_chars(language_code: str) -> list[tuple[str, str]]:\n"
+        '    """Retrieves predefined transliteration character tuples for a given language code.\n'
+        "    :param language_code: Language identifier (e.g. 'german', 'greek', 'cyrillic').\n"
+        '    :return: List of character replacement pairs.\n'
+        '    """\n'
+        "    code = language_code.strip().lower()\n"
+        "    mapping = {\n"
+        '        "german": GERMAN,\n'
+        '        "de": GERMAN,\n'
+        '        "greek": GREEK,\n'
+        '        "el": GREEK,\n'
+        '        "cyrillic": CYRILLIC,\n'
+        '        "ru": CYRILLIC,\n'
+        "    }\n"
+        "    return list(mapping.get(code, []))\n"
+    )
+    combined_content = modified_content.rstrip() + new_func
+    (repo / SPECIAL_PY_REL).write_text(combined_content, encoding="utf-8")
+
+    _print_scenario_header(
+        num=7,
+        title="Combined Mega-PR (New Symbols + Covered Changes + Doc Updates)",
+        desc="Combines documentation updates, safe covered function modifications, and a new uncovered function.",
+        expected_route="ROUTE_TO_TEST_GENERATION",
+        expected_llm="Gemini generates tests for uncovered 'extract_language_chars' (Priority Rule P1 overrides P2/P3).",
+        expected_docker="Docker runs both newly synthesized tests and existing regression suites.",
+        expected_diag="Evaluates overall test suite execution.",
+    )
+
+
 def _print_scenario_header(
     num: int,
     title: str,
@@ -304,6 +361,7 @@ SCENARIOS = {
     4: ("Contract Change -> Regression Failure & LLM Diagnosis (TEST_OUTDATED)", apply_scenario_4),
     5: ("Delete Covered Function -> Breaking Deletion Regression (Decision 1 Case B)", apply_scenario_5),
     6: ("Documentation Only -> Clean Non-Code Bypass (Rule P2: ROUTE_NO_OP)", apply_scenario_6),
+    7: ("Combined Mega-PR -> Full Multi-Component Orchestration (Rule P1 Priority)", apply_scenario_7),
 }
 
 
@@ -348,7 +406,7 @@ def main() -> None:
     while True:
         print_menu()
         try:
-            choice = input("Enter choice [0-6, q]: ").strip().lower()
+            choice = input("Enter choice [0-7, q]: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
             break
