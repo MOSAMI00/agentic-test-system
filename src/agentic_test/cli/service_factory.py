@@ -147,6 +147,11 @@ def default_create_workflow_engine(
                 if settings.anthropic_api_key is not None
                 else os.environ.get("ANTHROPIC_API_KEY")
             )
+            openrouter_key = (
+                settings.openrouter_api_key.get_secret_value()
+                if getattr(settings, "openrouter_api_key", None) is not None
+                else (os.environ.get("OPENROUTER_API_KEY") or os.environ.get("AGENTIC_TEST_OPENROUTER_API_KEY"))
+            )
 
             configured_model = (
                 settings.llm_model
@@ -155,7 +160,9 @@ def default_create_workflow_engine(
             )
 
             if not configured_model:
-                if gemini_key and not openai_key:
+                if openrouter_key and not (openai_key or gemini_key or anthropic_key):
+                    configured_model = "openrouter/openai/gpt-4o-mini"
+                elif gemini_key and not openai_key:
                     configured_model = "gemini/gemini-3.8-flash"
                 elif anthropic_key and not openai_key:
                     configured_model = "claude-3-5-sonnet-20241022"
@@ -163,7 +170,10 @@ def default_create_workflow_engine(
                     configured_model = "gpt-4o-mini"
 
             m = configured_model.lower()
-            if m.startswith("gemini/") or "gemini" in m:
+            if m.startswith("openrouter/") or "openrouter" in m:
+                has_api_key = bool(openrouter_key)
+                selected_key = openrouter_key
+            elif m.startswith("gemini/") or "gemini" in m:
                 has_api_key = bool(gemini_key)
                 selected_key = gemini_key
             elif m.startswith("anthropic/") or "claude" in m:
@@ -176,7 +186,7 @@ def default_create_workflow_engine(
             if not has_api_key:
                 raise ConfigurationError(
                     f"Live LLM service unavailable: API key not configured for model '{configured_model}'. "
-                    "Configure GEMINI_API_KEY, OPENAI_API_KEY, or run with --offline for local deterministic execution."
+                    "Configure OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or run with --offline for local deterministic execution."
                 )
             from agentic_test.generation.litellm_service import LiteLLMService
 

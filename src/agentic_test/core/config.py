@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[SecretStr] = None
     gemini_api_key: Optional[SecretStr] = None
     anthropic_api_key: Optional[SecretStr] = None
+    openrouter_api_key: Optional[SecretStr] = None
     llm_model: Optional[str] = None
 
 

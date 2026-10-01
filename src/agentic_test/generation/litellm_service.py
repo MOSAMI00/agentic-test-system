@@ -129,6 +129,8 @@ class LiteLLMService(LLMService):
     def _get_provider_env_var(model: str) -> str:
         """Maps model name to expected provider environment variable."""
         m = model.lower()
+        if m.startswith("openrouter/") or "openrouter" in m:
+            return "OPENROUTER_API_KEY"
         if m.startswith("anthropic/") or "claude" in m:
             return "ANTHROPIC_API_KEY"
         if m.startswith("gemini/") or "gemini" in m:
