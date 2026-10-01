@@ -43,14 +43,6 @@ class CognitiveLLMClassifier:
     Stage 2 §4.3.1.6 [FR-19], Stage 3 §4.4.4.6.
     """
 
-    CONFIDENCE_THRESHOLD: float = 0.70
-
-    # Categories reserved exclusively for deterministic Engine 1 triage
-    _RESERVED_DETERMINISTIC_CATEGORIES = (
-        FailureCategory.ENVIRONMENT_FAILURE,
-        FailureCategory.CONFIGURATION_ERROR,
-    )
-
     def __init__(self, llm_service: LLMService) -> None:
         self._llm_service = llm_service
 
@@ -123,7 +115,7 @@ class CognitiveLLMClassifier:
         :param target_symbol: Optional SymbolContract representing the tested entity.
         :param diff_hunk: Optional DiffHunk representing recent patch changes.
         :param diff_content: Optional raw unified diff string.
-        :return: Validated DiagnosisResponseSchema.
+        :return: Validated DiagnosisResponseSchema preserving raw category and confidence.
         """
         resolved_candidate_code = candidate_code or (candidate.candidate_code if candidate else None)
         resolved_diff_content = diff_content or (diff_hunk.content if diff_hunk else None)
@@ -165,28 +157,6 @@ class CognitiveLLMClassifier:
                 category=FailureCategory.UNKNOWN,
                 confidence=0.0,
                 explanation=f"Cognitive triage encountered unexpected error: {err}",
-            )
-
-        # Policy 1: Normalize reserved deterministic categories to UNKNOWN
-        if raw_response.category in self._RESERVED_DETERMINISTIC_CATEGORIES:
-            return DiagnosisResponseSchema(
-                category=FailureCategory.UNKNOWN,
-                confidence=raw_response.confidence,
-                explanation=(
-                    f"Category {raw_response.category.value} is reserved for deterministic rules; "
-                    f"normalized to UNKNOWN: {raw_response.explanation}"
-                ),
-            )
-
-        # Policy 2: Enforce confidence threshold (confidence < 0.70 -> UNKNOWN)
-        if raw_response.confidence < self.CONFIDENCE_THRESHOLD:
-            return DiagnosisResponseSchema(
-                category=FailureCategory.UNKNOWN,
-                confidence=raw_response.confidence,
-                explanation=(
-                    f"Low confidence ({raw_response.confidence:.2f} < {self.CONFIDENCE_THRESHOLD:.2f}): "
-                    f"{raw_response.explanation}"
-                ),
             )
 
         return raw_response

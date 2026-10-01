@@ -561,8 +561,8 @@ def test_cognitive_high_confidence_invalid_generated_test() -> None:
     assert mock_llm.call_count == 1
 
 
-def test_cognitive_low_confidence_normalized_to_unknown() -> None:
-    """Verifies response with confidence < 0.70 is normalized to UNKNOWN."""
+def test_cognitive_preserves_raw_confidence_and_category() -> None:
+    """Verifies response preserves raw category and confidence without premature mutation."""
     canned = DiagnosisResponseSchema(
         category=FailureCategory.APPLICATION_BUG,
         confidence=0.65,
@@ -574,28 +574,28 @@ def test_cognitive_low_confidence_normalized_to_unknown() -> None:
     evidence = _make_evidence(exit_code=1, traceback="AssertionError")
     result = classifier.classify(evidence)
 
-    assert result.category == FailureCategory.UNKNOWN
+    assert result.category == FailureCategory.APPLICATION_BUG
     assert result.confidence == 0.65
-    assert "Low confidence (0.65 < 0.70)" in result.explanation
+    assert result.explanation == "Ambiguous failure, could be application regression or flaky test."
     assert mock_llm.call_count == 1
 
 
 @pytest.mark.parametrize(
-    "reserved_cat",
+    "env_or_config_cat",
     [
         FailureCategory.ENVIRONMENT_FAILURE,
         FailureCategory.CONFIGURATION_ERROR,
     ],
 )
-def test_cognitive_normalizes_reserved_deterministic_categories_to_unknown(
-    reserved_cat: FailureCategory,
+def test_cognitive_preserves_environment_and_config_categories(
+    env_or_config_cat: FailureCategory,
 ) -> None:
     """
-    Verifies that if the LLM emits a deterministic-owned category,
-    it is normalized to UNKNOWN because deterministic rules own those categories.
+    Verifies that if the LLM detects an environment or configuration failure
+    not caught by regex rules, the category and explanation are preserved intact.
     """
     canned = DiagnosisResponseSchema(
-        category=reserved_cat,
+        category=env_or_config_cat,
         confidence=0.95,
         explanation="Environment or config issue detected by model.",
     )
@@ -605,9 +605,9 @@ def test_cognitive_normalizes_reserved_deterministic_categories_to_unknown(
     evidence = _make_evidence(exit_code=1, stderr="Something went wrong")
     result = classifier.classify(evidence)
 
-    assert result.category == FailureCategory.UNKNOWN
+    assert result.category == env_or_config_cat
     assert result.confidence == 0.95
-    assert "reserved for deterministic rules" in result.explanation
+    assert result.explanation == "Environment or config issue detected by model."
     assert mock_llm.call_count == 1
 
 
@@ -916,8 +916,8 @@ def test_service_application_bug_flags_is_application_bug_true() -> None:
     assert mock_llm.call_count == 1
 
 
-def test_service_low_confidence_produces_unknown_and_bug_flag_false() -> None:
-    """Verifies that low confidence LLM response normalizes to UNKNOWN with is_application_bug=False."""
+def test_service_low_confidence_preserves_category_and_confidence() -> None:
+    """Verifies that low confidence LLM response preserves category and confidence transparently."""
     canned = DiagnosisResponseSchema(
         category=FailureCategory.APPLICATION_BUG,
         confidence=0.62,
@@ -929,10 +929,10 @@ def test_service_low_confidence_produces_unknown_and_bug_flag_false() -> None:
     evidence = _make_evidence(exit_code=1, traceback="AssertionError")
     diagnosis = service.diagnose(evidence)
 
-    assert diagnosis.canonical_category == FailureCategory.UNKNOWN
-    assert diagnosis.is_application_bug is False
+    assert diagnosis.canonical_category == FailureCategory.APPLICATION_BUG
+    assert diagnosis.is_application_bug is True
     assert diagnosis.confidence == 0.62
-    assert "Low confidence" in diagnosis.explanation
+    assert diagnosis.explanation == "Possible bug but uncertain."
 
 
 def test_service_llm_failure_produces_fallback_diagnosis() -> None:
