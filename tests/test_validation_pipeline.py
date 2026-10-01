@@ -356,7 +356,7 @@ def test_validation_pipeline_path_quarantined_preserved() -> None:
 def test_validation_pipeline_path_gate_1_rejected_syntax() -> None:
     """
     Path 2: Gate 1 failure transitions to REJECTED_SYNTAX via validated reconstruction.
-    Preserves all fields, identity, retry count, created_at, with quarantine_reason remaining None.
+    Preserves all fields, identity, retry count, created_at, with quarantine_reason populated from gate error_message.
     """
     pipeline = ValidationPipeline()
     cand = _make_candidate(
@@ -368,7 +368,8 @@ def test_validation_pipeline_path_gate_1_rejected_syntax() -> None:
     updated_cand, result = pipeline.validate_candidate(cand_with_retries)
 
     assert updated_cand.validation_status == ValidationStatus.REJECTED_SYNTAX
-    assert updated_cand.quarantine_reason is None
+    assert updated_cand.quarantine_reason == result.error_message
+    assert "SyntaxError" in (updated_cand.quarantine_reason or "")
     assert updated_cand.candidate_id == cand_with_retries.candidate_id
     assert updated_cand.run_id == cand_with_retries.run_id
     assert updated_cand.target_symbol_name == cand_with_retries.target_symbol_name
@@ -385,7 +386,7 @@ def test_validation_pipeline_path_gate_1_rejected_syntax() -> None:
 def test_validation_pipeline_path_gate_2_rejected_security() -> None:
     """
     Path 3: Gate 2 failure transitions to REJECTED_SECURITY via validated reconstruction.
-    Preserves all fields, identity, retry count, created_at, with quarantine_reason remaining None.
+    Preserves all fields, identity, retry count, created_at, with quarantine_reason populated from gate error_message.
     """
     pipeline = ValidationPipeline()
     cand = _make_candidate(
@@ -397,7 +398,8 @@ def test_validation_pipeline_path_gate_2_rejected_security() -> None:
     updated_cand, result = pipeline.validate_candidate(cand)
 
     assert updated_cand.validation_status == ValidationStatus.REJECTED_SECURITY
-    assert updated_cand.quarantine_reason is None
+    assert updated_cand.quarantine_reason == result.error_message
+    assert "Security policy violation" in (updated_cand.quarantine_reason or "")
     assert updated_cand.candidate_id == cand.candidate_id
     assert updated_cand.run_id == cand.run_id
     assert updated_cand.retry_count == cand.retry_count

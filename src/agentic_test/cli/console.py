@@ -150,11 +150,16 @@ def print_workflow_summary(
                 else:
                     reason_str = cand.quarantine_reason
             elif cand.validation_status == ValidationStatus.REJECTED_SYNTAX:
-                reason_str = "Gate 1 Syntax Violation"
+                reason_str = cand.quarantine_reason or "Gate 1 Syntax Violation"
             elif cand.validation_status == ValidationStatus.REJECTED_SECURITY:
-                reason_str = "Gate 2 Security Violation"
+                reason_str = cand.quarantine_reason or "Gate 2 Security Violation"
             elif cand.validation_status == ValidationStatus.REJECTED_COLLECTION:
-                reason_str = "Gate 3 Collection Failure"
+                if cand.quarantine_reason and "zero test items were collected" in cand.quarantine_reason:
+                    reason_str = "Gate 3 (0 tests collected)"
+                elif cand.quarantine_reason:
+                    reason_str = cand.quarantine_reason
+                else:
+                    reason_str = "Gate 3 Collection Failure"
             else:
                 reason_str = "-"
 

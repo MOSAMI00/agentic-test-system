@@ -65,15 +65,22 @@ class ValidationPipeline:
 
     @staticmethod
     def _reconstruct_candidate(
-        candidate: TestCandidate, status: ValidationStatus
+        candidate: TestCandidate,
+        status: ValidationStatus,
+        quarantine_reason: Optional[str] = None,
     ) -> TestCandidate:
         """
         Reconstructs a TestCandidate with an updated validation_status via validated
         instantiation to prevent validation bypass (such as from model_copy).
         Preserves all candidate fields, identity, retry_count, and quarantine_reason.
         """
+        effective_reason = quarantine_reason if quarantine_reason is not None else candidate.quarantine_reason
         return TestCandidate(
-            **{**candidate.__dict__, "validation_status": status}
+            **{
+                **candidate.__dict__,
+                "validation_status": status,
+                "quarantine_reason": effective_reason,
+            }
         )
 
     def validate_candidate(
@@ -98,7 +105,9 @@ class ValidationPipeline:
             result = validator.validate(candidate)
             if not result.passed:
                 # Update candidate validation status to match rejected gate via validated reconstruction
-                updated_candidate = self._reconstruct_candidate(candidate, result.status)
+                updated_candidate = self._reconstruct_candidate(
+                    candidate, result.status, quarantine_reason=result.error_message
+                )
                 return updated_candidate, result
 
         # Run Gate 3 Collection validation if configured and not already executed in self._validators
@@ -111,7 +120,9 @@ class ValidationPipeline:
                 static_gates_passed=True,
             )
             if not coll_result.passed:
-                updated_candidate = self._reconstruct_candidate(candidate, coll_result.status)
+                updated_candidate = self._reconstruct_candidate(
+                    candidate, coll_result.status, quarantine_reason=coll_result.error_message
+                )
                 return updated_candidate, coll_result
 
             # Collection passed
