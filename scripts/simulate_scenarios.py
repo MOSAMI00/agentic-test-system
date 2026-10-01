@@ -180,9 +180,16 @@ def apply_scenario_4(repo: Path) -> None:
         '    """ Given a replacement char list, this adds uppercase chars to the list """'
     )
     contract_change = (
-        'def add_uppercase_char(char_list: list[tuple[str, str]], as_dict: bool = True):\n'
-        '    """Intentional breaking change: Contract updated in v10.0 to return dict mapping."""\n'
-        '    return {c: x.upper() for c, x in char_list}'
+        'def add_uppercase_char(char_list: list[tuple[str, str]]) -> list[tuple[str, str]]:\n'
+        '    """Breaking contract change (v10.0): Function returns a new list with uppercase pairs\n'
+        '    appended at the end to preserve input order, rather than prepending in-place."""\n'
+        '    result = list(char_list)\n'
+        '    for item in char_list:\n'
+        '        char, xlate = item\n'
+        '        upper_pair = (char.upper(), xlate.capitalize())\n'
+        '        if upper_pair not in result and char != upper_pair[0]:\n'
+        '            result.append(upper_pair)\n'
+        '    return result'
     )
     # Truncate original function body
     old_func_end = base_content.find("# Language specific pre translations")
@@ -194,10 +201,10 @@ def apply_scenario_4(repo: Path) -> None:
     _print_scenario_header(
         num=4,
         title="Intentional Contract Change (Triage: TEST_OUTDATED)",
-        desc="Updated 'add_uppercase_char' signature and contract to return a dictionary instead of a list.",
+        desc="Updated 'add_uppercase_char' contract in v10.0 to append uppercase characters instead of prepending in-place.",
         expected_route="ROUTE_TO_DOCKER_EXECUTION",
         expected_llm="Cognitive Triage detects that contract was intentionally updated in the diff.",
-        expected_docker="Old regression test fails on old expectations.",
+        expected_docker="Old regression test fails on old expectations (Exit Code: 1).",
         expected_diag="1 Failure Diagnosis -> Category: TEST_OUTDATED.",
     )
 

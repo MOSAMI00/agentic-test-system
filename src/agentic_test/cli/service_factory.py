@@ -156,7 +156,7 @@ def default_create_workflow_engine(
 
             if not configured_model:
                 if gemini_key and not openai_key:
-                    configured_model = "gemini/gemini-1.5-flash"
+                    configured_model = "gemini/gemini-3.8-flash"
                 elif anthropic_key and not openai_key:
                     configured_model = "claude-3-5-sonnet-20241022"
                 else:

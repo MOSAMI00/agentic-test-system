@@ -61,3 +61,4 @@ Thumbs.db
 
 # Agentic Test Local Run Artifacts
 .agentic_test/
+*.db

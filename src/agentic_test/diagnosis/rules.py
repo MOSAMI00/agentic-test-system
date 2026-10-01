@@ -192,11 +192,15 @@ class DeterministicRuleClassifier:
 
         # Rule 2d: Collection / Fixture / Setup error
         if self._is_collection_or_fixture_error(combined_text):
-            return RuleClassificationResult(
-                category=FailureCategory.INVALID_GENERATED_TEST,
-                confidence=1.0,
-                explanation="Generated test failed pytest collection or fixture resolution.",
-            )
+            if evidence.candidate_id is not None:
+                return RuleClassificationResult(
+                    category=FailureCategory.INVALID_GENERATED_TEST,
+                    confidence=1.0,
+                    explanation="Generated test failed pytest collection or fixture resolution.",
+                )
+            # Baseline test suite failed collection (e.g. application runtime import/syntax crash)
+            # Defer to cognitive triage to determine if it is APPLICATION_BUG or TEST_OUTDATED
+            return None
 
         # Rule 2e: SyntaxError or NameError attributable to generated test
         if self._is_syntax_or_name_error_in_test(combined_text):

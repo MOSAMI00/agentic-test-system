@@ -64,8 +64,10 @@ def generate_tests_node(
     """
     if state.plan is None:
         raise ValueError("ExecutionPlan is required for generate_tests_node")
-    diff_hunks = state.snapshot.diff_hunks if state.snapshot is not None else ()
-    generated = generation_service.generate(state.plan, diff_hunks=diff_hunks)
+    if state.snapshot is not None and state.snapshot.diff_hunks:
+        generated = generation_service.generate(state.plan, diff_hunks=state.snapshot.diff_hunks)
+    else:
+        generated = generation_service.generate(state.plan)
     return state.model_copy(update={"candidates": tuple(generated)})
 
 
@@ -153,11 +155,16 @@ def diagnose_failure_node(
             if state.snapshot and state.snapshot.diff_hunks
             else None
         )
+        baseline_sym = (
+            next(iter(symbol_by_name.values()))
+            if len(symbol_by_name) == 1
+            else (state.snapshot.affected_symbols[0] if state.snapshot and state.snapshot.affected_symbols else None)
+        )
         diag = diagnosis_service.diagnose(
             evidence=state.baseline_evidence,
             candidate=None,
             candidate_code=None,
-            target_symbol=None,
+            target_symbol=baseline_sym,
             diff_content=baseline_diff,
         )
         diagnoses_list.append(diag)

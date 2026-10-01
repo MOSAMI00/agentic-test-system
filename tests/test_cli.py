@@ -440,10 +440,12 @@ def test_default_factory_offline_mode(git_repo: Path, db_path: Path) -> None:
 
 
 def test_default_factory_live_mode_missing_credentials_fails(git_repo: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifies that default_create_workflow_engine(offline=False) raises ConfigurationError when OPENAI_API_KEY is unset."""
+    """Verifies that default_create_workflow_engine(offline=False) raises ConfigurationError when live credentials are unset."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     from agentic_test.core.config import settings
     monkeypatch.setattr(settings, "openai_api_key", None)
+    monkeypatch.setattr(settings, "gemini_api_key", None)
 
     with pytest.raises(ConfigurationError) as exc_info:
         default_create_workflow_engine(db_path=db_path, repo_path=git_repo, offline=False)
@@ -455,8 +457,10 @@ def test_default_factory_live_mode_missing_credentials_fails(git_repo: Path, db_
 def test_cli_run_without_offline_fails_with_exit_code_2(runner: CliRunner, git_repo: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifies running without --offline fails closed with exit code 2 and configuration guidance."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     from agentic_test.core.config import settings
     monkeypatch.setattr(settings, "openai_api_key", None)
+    monkeypatch.setattr(settings, "gemini_api_key", None)
 
     result = runner.invoke(app, ["run", "--repo", str(git_repo), "--db", str(db_path)])
     assert result.exit_code == 2
