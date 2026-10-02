@@ -23,6 +23,16 @@ from agentic_test.core.models import (
 from agentic_test.core.state import WorkflowState
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi(text: Optional[str]) -> str:
+    """Strips terminal ANSI color and styling escape sequences from text."""
+    if not text:
+        return ""
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
 def sanitize_identifier(name: str) -> str:
     """Sanitizes qualified symbol names into safe filesystem string identifiers."""
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", name)
@@ -118,23 +128,26 @@ def _format_evidence_snippet(title: str, ev: ExecutionEvidence) -> List[str]:
         "",
     ]
     if ev.traceback:
+        clean_tb = strip_ansi(ev.traceback).strip()
         snippet_lines.extend([
             "```text",
-            ev.traceback.strip(),
+            clean_tb,
             "```",
             "",
         ])
     elif ev.stderr:
+        clean_err = strip_ansi(ev.stderr).strip()
         snippet_lines.extend([
             "```text",
-            ev.stderr.strip(),
+            clean_err,
             "```",
             "",
         ])
     elif ev.stdout:
+        clean_out = strip_ansi(ev.stdout).strip()[:1000]
         snippet_lines.extend([
             "```text",
-            ev.stdout.strip()[:1000],
+            clean_out,
             "```",
             "",
         ])
@@ -237,7 +250,7 @@ def _generate_report_markdown(
         errors_found = True
         lines.extend([
             "> [!CAUTION]",
-            f"> **Pipeline Execution Error**: {state.error_message}",
+            f"> **Pipeline Execution Error**: {strip_ansi(state.error_message)}",
             "",
         ])
 
@@ -249,7 +262,7 @@ def _generate_report_markdown(
             "> **Source Syntax Errors Detected in Target Repository**:",
         ])
         for err in state.snapshot.syntax_errors:
-            lines.append(f"> - `{err}`")
+            lines.append(f"> - `{strip_ansi(err)}`")
         lines.append("")
 
     # C. Application Defect Alert (Critical)
@@ -263,7 +276,7 @@ def _generate_report_markdown(
             "",
         ])
         for bug in app_bugs:
-            lines.append(f"> - **Diagnosis `{bug.diagnosis_id}`** (Evidence `{bug.evidence_id}`): {bug.explanation}")
+            lines.append(f"> - **Diagnosis `{bug.diagnosis_id}`** (Evidence `{bug.evidence_id}`): {strip_ansi(bug.explanation)}")
         lines.append("")
 
     # D. Generation & Validation Failures
@@ -282,8 +295,9 @@ def _generate_report_markdown(
                 if c.candidate_id in file_link_by_cand
                 else "-"
             )
+            q_reason = strip_ansi(c.quarantine_reason) if c.quarantine_reason else "-"
             lines.append(
-                f"| `{c.candidate_id}` | `{c.target_symbol_name}` | `{c.validation_status.value}` | {c.quarantine_reason or '-'} | {link_str} |"
+                f"| `{c.candidate_id}` | `{c.target_symbol_name}` | `{c.validation_status.value}` | {q_reason} | {link_str} |"
             )
         lines.append("")
 
@@ -334,7 +348,7 @@ def _generate_report_markdown(
             fn_str = f"[`{rel_link}`](./{rel_link})"
         else:
             fn_str = "-"
-        reason_str = c.quarantine_reason or "-"
+        reason_str = strip_ansi(c.quarantine_reason) if c.quarantine_reason else "-"
 
         lines.append(
             f"| `{c.candidate_id}` | `{c.target_symbol_name}` | `{c.validation_status.value}` | {reason_str} | {exit_code_str} | {timed_out_str} | {dur_str} | {fn_str} |"
@@ -391,7 +405,7 @@ def _generate_report_markdown(
             bug_flag = "**YES**" if d.is_application_bug else "No"
             conf_str = f"`{d.confidence:.2f}` ({int(d.confidence * 100)}%)"
             lines.append(
-                f"| `{d.diagnosis_id}` | `{d.evidence_id}` | `{d.canonical_category.value}` | {conf_str} | `{d.triage_engine.value}` | {bug_flag} | {d.explanation} |"
+                f"| `{d.diagnosis_id}` | `{d.evidence_id}` | `{d.canonical_category.value}` | {conf_str} | `{d.triage_engine.value}` | {bug_flag} | {strip_ansi(d.explanation)} |"
             )
         lines.append("")
 

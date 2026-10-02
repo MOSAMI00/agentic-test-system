@@ -90,7 +90,7 @@ class RepositorySnapshot(BaseModel):
     syntax_errors: Tuple[str, ...] = Field(default_factory=tuple)
     all_symbols: Tuple[SymbolContract, ...] = Field(
         default_factory=tuple,
-        description="All parsed public application symbols discovered in repository.",
+        description="All parsed application symbols discovered in repository.",
     )
 
 

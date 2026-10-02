@@ -19,7 +19,30 @@ from agentic_test.core.models import (
     WorkflowRoute,
 )
 from agentic_test.core.state import WorkflowState
-from agentic_test.reporting.exporter import export_run_artifacts, sanitize_identifier
+from agentic_test.reporting.exporter import (
+    export_run_artifacts,
+    sanitize_identifier,
+    strip_ansi,
+)
+
+
+def test_strip_ansi_functionality() -> None:
+    """Verifies that terminal ANSI escape codes are completely stripped from strings."""
+    assert strip_ansi("") == ""
+    assert strip_ansi(None) == ""
+    assert strip_ansi("Plain text with no escapes") == "Plain text with no escapes"
+
+    # Terminal color codes (foreground, background, resets)
+    colored = "\x1b[94mdef\x1b[39;49;00m \x1b[92m_transliterate\x1b[39;49;00m(text: \x1b[96mstr\x1b[39;49;00m):"
+    assert strip_ansi(colored) == "def _transliterate(text: str):"
+
+    # Bold, underline, and error markers
+    styled = "\x1b[1m\x1b[31mE   ModuleNotFoundError: No module named 'text_unidecode'\x1b[0m"
+    assert strip_ansi(styled) == "E   ModuleNotFoundError: No module named 'text_unidecode'"
+
+    # Realistic pytest traceback line snippet
+    raw_tb_line = " level = \x1b[94m0\x1b[39;49;00m\x1b[90m\x1b[39;49;00m\n \x1b[94mif\x1b[39;49;00m name.startswith(\x1b[33m'\x1b[39;49;00m\x1b[33m.\x1b[39;49;00m\x1b[33m'\x1b[39;49;00m):"
+    assert strip_ansi(raw_tb_line) == " level = 0\n if name.startswith('.'):"
 
 
 def test_sanitize_identifier() -> None:
@@ -379,5 +402,86 @@ def test_export_run_artifacts_reports_failed_baseline_regression_in_errors_secti
 
     # The clean execution note must NOT appear because baseline failed
     assert "No process errors, validation rejections, or execution failures were encountered" not in report_text
+
+
+def test_export_run_artifacts_strips_ansi_codes_from_reports(tmp_path: Path) -> None:
+    """Verifies that all ANSI codes in tracebacks, errors, and diagnostics are stripped in report.md."""
+    repo_dir = tmp_path / "ansi_test_repo"
+    repo_dir.mkdir()
+
+    raw_colored_tb = (
+        "\x1b[31m=================================== FAILURES ===================================\x1b[0m\n"
+        "\x1b[94mdef\x1b[39;49;00m \x1b[92mtest_accented\x1b[39;49;00m():\n"
+        ">       \x1b[94massert\x1b[39;49;00m False\n"
+        "\x1b[1m\x1b[31mE       AssertionError\x1b[0m"
+    )
+    raw_colored_err = "\x1b[31mModuleNotFoundError: \x1b[1mNo module named 'text_unidecode'\x1b[0m"
+
+    cand = TestCandidate(
+        candidate_id="tc-ansi",
+        run_id="run-ansi-1",
+        target_symbol_name="mod.func",
+        test_file_path=Path("tests/test_mod.py"),
+        candidate_code="def test_accented(): assert True",
+        validation_status=ValidationStatus.PASSED,
+    )
+    ev = ExecutionEvidence(
+        evidence_id="ev-ansi",
+        run_id="run-ansi-1",
+        candidate_id="tc-ansi",
+        exit_code=1,
+        stdout="",
+        stderr=raw_colored_err,
+        traceback=raw_colored_tb,
+        duration_sec=0.45,
+    )
+    diag = FailureDiagnosis(
+        diagnosis_id="diag-ansi",
+        evidence_id="ev-ansi",
+        canonical_category=FailureCategory.ENVIRONMENT_FAILURE,
+        confidence=0.99,
+        triage_engine=TriageEngine.DETERMINISTIC_RULE,
+        explanation="\x1b[31mMissing dependency: \x1b[1mtext_unidecode\x1b[0m",
+        is_application_bug=False,
+    )
+    snapshot = RepositorySnapshot(
+        repo_path=repo_dir,
+        current_commit="1" * 40,
+        base_commit="0" * 40,
+        branch_name="main",
+        source_tree_hash="abc",
+        is_valid=True,
+        syntax_errors=("\x1b[31mSyntaxError in file.py\x1b[0m",),
+    )
+    state = WorkflowState(
+        run_id="run-ansi-1",
+        repo_path=repo_dir,
+        snapshot=snapshot,
+        candidates=(cand,),
+        evidences=(ev,),
+        diagnoses=(diag,),
+        final_status="COMPLETED",
+        error_message="\x1b[33mWarning in execution node\x1b[0m",
+    )
+
+    run_dir = export_run_artifacts(state)
+    assert run_dir is not None
+
+    report_text = (run_dir / "report.md").read_text(encoding="utf-8")
+
+    # Assert NO ANSI escape sequences exist in the report
+    assert "\x1b[" not in report_text
+    assert "[31m" not in report_text
+    assert "[39;49;00m" not in report_text
+    assert "[94m" not in report_text
+
+    # Assert clean versions of the strings are present
+    assert "def test_accented():" in report_text
+    assert "assert False" in report_text
+    assert "E       AssertionError" in report_text
+    assert "Missing dependency: text_unidecode" in report_text
+    assert "SyntaxError in file.py" in report_text
+    assert "Warning in execution node" in report_text
+
 
 

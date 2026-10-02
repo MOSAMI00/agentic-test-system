@@ -29,7 +29,7 @@ class CandidateSynthesisSchema(BaseModel):
         default_factory=tuple,
         description=(
             "Explicit, complete Python import statements required by the test (e.g., 'import pytest', "
-            "'from slugify import special'). Do NOT output bare module names."
+            "'from ... import ...'). Do NOT output bare module names."
         ),
     )
     test_code: str = Field(
