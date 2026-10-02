@@ -110,9 +110,41 @@ def _assemble_candidate_file(candidate: TestCandidate, run_id: str) -> str:
     return "\n".join(parts)
 
 
+def _format_evidence_snippet(title: str, ev: ExecutionEvidence) -> List[str]:
+    """Formats traceback, stderr, or stdout code fence snippets for a failed execution evidence."""
+    to_str = " (TIMED OUT)" if (ev.timed_out or ev.exit_code == 124) else ""
+    snippet_lines = [
+        f"#### {title} (Exit Code: `{ev.exit_code}`{to_str}, Duration: `{ev.duration_sec:.2f}s`)",
+        "",
+    ]
+    if ev.traceback:
+        snippet_lines.extend([
+            "```text",
+            ev.traceback.strip(),
+            "```",
+            "",
+        ])
+    elif ev.stderr:
+        snippet_lines.extend([
+            "```text",
+            ev.stderr.strip(),
+            "```",
+            "",
+        ])
+    elif ev.stdout:
+        snippet_lines.extend([
+            "```text",
+            ev.stdout.strip()[:1000],
+            "```",
+            "",
+        ])
+    return snippet_lines
+
+
 def _generate_report_markdown(
     state: WorkflowState,
     passed_files: List[Tuple[str, Path, TestCandidate]],
+
     quarantined_files: List[Tuple[str, Path, TestCandidate]],
 ) -> str:
     """Generates the run execution summary Markdown report."""
@@ -255,42 +287,25 @@ def _generate_report_markdown(
             )
         lines.append("")
 
-    # E. Execution Failures
-    failed_evidences = [ev for ev in state.evidences if ev.exit_code != 0]
-    if failed_evidences:
+    # E. Execution Failures (including Baseline Regression Suite and Candidate Tests)
+    failed_baseline = (
+        state.baseline_evidence
+        if state.baseline_evidence is not None and state.baseline_evidence.exit_code != 0
+        else None
+    )
+    failed_candidates = [ev for ev in state.evidences if ev.exit_code != 0]
+
+    if failed_baseline is not None or failed_candidates:
         errors_found = True
         lines.extend([
             "### Execution Failures & Traceback Snippets",
             "",
         ])
-        for ev in failed_evidences:
+        if failed_baseline is not None:
+            lines.extend(_format_evidence_snippet("Baseline Regression Tests (Existing Tests)", failed_baseline))
+        for ev in failed_candidates:
             cand_id = ev.candidate_id or "unknown"
-            to_str = " (TIMED OUT)" if (ev.timed_out or ev.exit_code == 124) else ""
-            lines.extend([
-                f"#### Candidate `{cand_id}` (Exit Code: `{ev.exit_code}`{to_str}, Duration: `{ev.duration_sec:.2f}s`)",
-                "",
-            ])
-            if ev.traceback:
-                lines.extend([
-                    "```text",
-                    ev.traceback.strip(),
-                    "```",
-                    "",
-                ])
-            elif ev.stderr:
-                lines.extend([
-                    "```text",
-                    ev.stderr.strip(),
-                    "```",
-                    "",
-                ])
-            elif ev.stdout:
-                lines.extend([
-                    "```text",
-                    ev.stdout.strip()[:1000],
-                    "```",
-                    "",
-                ])
+            lines.extend(_format_evidence_snippet(f"Candidate `{cand_id}`", ev))
 
     if not errors_found:
         lines.extend([

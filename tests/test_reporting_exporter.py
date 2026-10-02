@@ -322,3 +322,62 @@ def test_export_run_artifacts_quarantine_isolation_and_reporting(tmp_path: Path)
     # Section 4 table link
     assert "[`quarantine/quarantined_dangerous_module_exec_cmd_tc-quarantine.py.txt`](./quarantine/quarantined_dangerous_module_exec_cmd_tc-quarantine.py.txt)" in report_text
 
+
+def test_export_run_artifacts_reports_failed_baseline_regression_in_errors_section(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "baseline_fail_repo"
+    repo_dir.mkdir()
+
+    # 1. Baseline evidence has failed exit_code (e.g. exit_code=1 from existing regression tests)
+    base_ev = ExecutionEvidence(
+        evidence_id="ev-base-fail",
+        run_id="run-base-fail",
+        candidate_id=None,
+        exit_code=1,
+        stdout="collected 10 items, 1 failed",
+        stderr="",
+        traceback="def test_existing():\n>   assert 1 == 2\nE   AssertionError: assert 1 == 2",
+        duration_sec=0.85,
+    )
+
+    # 2. State has no candidate execution failures and no quarantined candidates
+    cand_passed = TestCandidate(
+        candidate_id="tc-pass-only",
+        run_id="run-base-fail",
+        target_symbol_name="mod.func",
+        test_file_path=Path("tests/test_mod.py"),
+        candidate_code="def test_func(): assert True",
+        validation_status=ValidationStatus.PASSED,
+    )
+    ev_passed = ExecutionEvidence(
+        evidence_id="ev-pass",
+        run_id="run-base-fail",
+        candidate_id="tc-pass-only",
+        exit_code=0,
+        stdout="1 passed",
+        stderr="",
+        duration_sec=0.2,
+    )
+
+    state = WorkflowState(
+        run_id="run-base-fail",
+        repo_path=repo_dir,
+        candidates=(cand_passed,),
+        baseline_evidence=base_ev,
+        evidences=(ev_passed,),
+        final_status="COMPLETED",
+    )
+
+    run_dir = export_run_artifacts(state)
+    assert run_dir is not None
+
+    report_text = (run_dir / "report.md").read_text(encoding="utf-8")
+
+    # The errors section MUST include the baseline execution failure
+    assert "### Execution Failures & Traceback Snippets" in report_text
+    assert "#### Baseline Regression Tests (Existing Tests) (Exit Code: `1`, Duration: `0.85s`)" in report_text
+    assert "AssertionError: assert 1 == 2" in report_text
+
+    # The clean execution note must NOT appear because baseline failed
+    assert "No process errors, validation rejections, or execution failures were encountered" not in report_text
+
+
