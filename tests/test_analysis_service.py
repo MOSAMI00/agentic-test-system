@@ -542,3 +542,19 @@ def test_modifying_test_function_without_deletion_is_absent_from_affected_and_de
     assert "pkg.calc.multiply" in deleted_names
 
 
+def test_analysis_service_populates_all_symbols(sample_git_repo: Path) -> None:
+    """Verifies that AnalysisService populates all_symbols on RepositorySnapshot."""
+    service = AnalysisService()
+    snapshot = service.analyze(sample_git_repo)
+
+    # Clean repo: zero diff hunks, zero affected symbols
+    assert len(snapshot.diff_hunks) == 0
+    assert len(snapshot.affected_symbols) == 0
+
+    # all_symbols contains discovered application symbols
+    all_names = {s.qualified_name for s in snapshot.all_symbols}
+    assert "pkg.calc.add" in all_names
+    assert "pkg.calc.multiply" in all_names
+
+
+

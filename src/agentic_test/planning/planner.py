@@ -19,6 +19,7 @@ from agentic_test.core.models import (
 )
 from agentic_test.planning.rules import (
     compute_decision_hash,
+    evaluate_bootstrap_rules,
     evaluate_precedence_rules,
 )
 
@@ -38,13 +39,20 @@ class ExecutionPlanner:
         """
         self._test_discovery = test_discovery or TestDiscovery()
 
-    def plan(self, snapshot: RepositorySnapshot) -> ExecutionPlan:
+    def plan(
+        self,
+        snapshot: RepositorySnapshot,
+        bootstrap: bool = False,
+        max_targets: int = 5,
+    ) -> ExecutionPlan:
         """
         Synthesizes an immutable ExecutionPlan from a RepositorySnapshot.
         Stage 3 Section 4.4.4.2 Part 2 public contract.
 
         Args:
             snapshot: Immutable point-in-time repository snapshot.
+            bootstrap: If True, evaluates in cold-start bootstrap mode across clean repositories.
+            max_targets: Maximum number of uncovered targets to select in bootstrap mode.
 
         Returns:
             Frozen ExecutionPlan containing selected route, target symbols,
@@ -53,8 +61,12 @@ class ExecutionPlanner:
         positively_associated_symbols: Set[str] = set()
         symbol_to_test_files: Dict[str, Set[Path]] = defaultdict(set)
 
-        # Collect static associations for surviving affected symbols and deleted symbols (Decision B)
-        all_actionable_symbols = list(snapshot.affected_symbols) + list(snapshot.deleted_symbols)
+        if bootstrap:
+            all_actionable_symbols = list(snapshot.all_symbols)
+        else:
+            all_actionable_symbols = list(snapshot.affected_symbols) + list(snapshot.deleted_symbols)
+
+        # Collect static associations for actionable symbols
         if all_actionable_symbols and snapshot.existing_test_files:
             for test_file in snapshot.existing_test_files:
                 resolved_test_path = (
@@ -73,14 +85,22 @@ class ExecutionPlanner:
                         positively_associated_symbols.add(assoc.target_symbol)
                         symbol_to_test_files[assoc.target_symbol].add(test_file)
 
-        # Evaluate rules P1 -> P2 -> Decision 1 -> P3 -> P4
-        decision = evaluate_precedence_rules(
-            diff_hunks=snapshot.diff_hunks,
-            affected_symbols=snapshot.affected_symbols,
-            positively_associated_symbols=positively_associated_symbols,
-            symbol_to_test_files=symbol_to_test_files,
-            deleted_symbols=snapshot.deleted_symbols,
-        )
+        # Evaluate rules: dedicated independent evaluation for bootstrap vs standard diff precedence
+        if bootstrap:
+            decision = evaluate_bootstrap_rules(
+                all_symbols=snapshot.all_symbols,
+                positively_associated_symbols=positively_associated_symbols,
+                symbol_to_test_files=symbol_to_test_files,
+                max_bootstrap_targets=max_targets,
+            )
+        else:
+            decision = evaluate_precedence_rules(
+                diff_hunks=snapshot.diff_hunks,
+                affected_symbols=snapshot.affected_symbols,
+                positively_associated_symbols=positively_associated_symbols,
+                symbol_to_test_files=symbol_to_test_files,
+                deleted_symbols=snapshot.deleted_symbols,
+            )
 
         # Calculate cryptographic decision hash
         decision_hash = compute_decision_hash(

@@ -270,3 +270,66 @@ def evaluate_precedence_rules(
         target_symbols=ordered_target_symbols,
         existing_tests_to_run=tuple(sorted(regression_tests, key=lambda p: p.as_posix())),
     )
+
+
+def evaluate_bootstrap_rules(
+    all_symbols: Sequence[SymbolContract],
+    positively_associated_symbols: Set[str],
+    symbol_to_test_files: Dict[str, Set[Path]],
+    max_bootstrap_targets: int = 5,
+) -> RoutingDecision:
+    """
+    Evaluates cold-start bootstrap mode routing across repository symbols independently of diff hunks.
+
+    Args:
+        all_symbols: All parsed public application symbols discovered in repository.
+        positively_associated_symbols: Set of symbol qualified names with STATICALLY_ASSOCIATED evidence.
+        symbol_to_test_files: Mapping from symbol qualified name to distinct test paths with positive evidence.
+        max_bootstrap_targets: Maximum number of uncovered targets to select for generation (default: 5).
+
+    Returns:
+        RoutingDecision detailing route, rationale, target symbols, and existing tests to run.
+    """
+    if len(all_symbols) == 0:
+        return RoutingDecision(
+            route=WorkflowRoute.ROUTE_NO_OP,
+            rationale="Bootstrap scan found no application symbols in repository",
+            target_symbols=(),
+            existing_tests_to_run=(),
+        )
+
+    covered: List[SymbolContract] = []
+    uncovered: List[SymbolContract] = []
+    for sym in all_symbols:
+        if sym.qualified_name in positively_associated_symbols:
+            covered.append(sym)
+        else:
+            uncovered.append(sym)
+
+    if len(uncovered) == 0:
+        return RoutingDecision(
+            route=WorkflowRoute.ROUTE_NO_OP,
+            rationale=f"Bootstrap scan complete: all {len(all_symbols)} application symbols possess positive test associations",
+            target_symbols=(),
+            existing_tests_to_run=(),
+        )
+
+    ordered_targets = order_symbols_structurally(uncovered)
+    if max_bootstrap_targets > 0:
+        ordered_targets = ordered_targets[:max_bootstrap_targets]
+
+    regression_tests: Set[Path] = set()
+    for sym in covered:
+        regression_tests.update(symbol_to_test_files.get(sym.qualified_name, set()))
+
+    rationale = (
+        f"Bootstrap mode: test generation scheduled for {len(ordered_targets)} "
+        f"uncovered symbol(s) out of {len(uncovered)} total uncovered"
+    )
+
+    return RoutingDecision(
+        route=WorkflowRoute.ROUTE_TO_TEST_GENERATION,
+        rationale=rationale,
+        target_symbols=ordered_targets,
+        existing_tests_to_run=tuple(sorted(regression_tests, key=lambda p: p.as_posix())),
+    )

@@ -58,7 +58,14 @@ def validate_repo_path(repo_path: Path) -> Path:
     return repo_path.resolve()
 
 
-def _execute_new_run(repo_path: Path, db_path: Path, offline: bool = False, model: Optional[str] = None) -> None:
+def _execute_new_run(
+    repo_path: Path,
+    db_path: Path,
+    offline: bool = False,
+    model: Optional[str] = None,
+    bootstrap: bool = False,
+    max_targets: int = 5,
+) -> None:
     """Executes a new end-to-end test generation run."""
     import os
     if model:
@@ -92,13 +99,23 @@ def _execute_new_run(repo_path: Path, db_path: Path, offline: bool = False, mode
         branch_name="unknown",
         final_status="INITIALIZED",
     )
+    config_payload = {"offline": offline}
+    if bootstrap:
+        config_payload["bootstrap"] = True
+        config_payload["max_targets"] = max_targets
+
     event_store.emit_event(
         run_id=run_id,
         event_type="CONFIG_MODE",
-        payload={"offline": offline},
+        payload=config_payload,
     )
 
-    initial_state = WorkflowState(run_id=run_id, repo_path=resolved_repo)
+    initial_state = WorkflowState(
+        run_id=run_id,
+        repo_path=resolved_repo,
+        bootstrap=bootstrap,
+        max_targets=max_targets,
+    )
 
     try:
         final_state = engine.run(initial_state)
@@ -212,12 +229,30 @@ def run_command(
         "-m",
         help="Cognitive LLM model identifier (e.g. 'gemini/gemini-1.5-flash', 'gpt-4o-mini').",
     ),
+    bootstrap: bool = typer.Option(
+        False,
+        "--bootstrap",
+        "-b",
+        help="Execute in cold-start bootstrap mode across clean repositories without diffs.",
+    ),
+    max_targets: int = typer.Option(
+        5,
+        "--max-targets",
+        help="Maximum number of uncovered symbols to target for generation in bootstrap mode.",
+    ),
 ) -> None:
     """Executes a new pipeline run or resumes an interrupted run."""
     if resume is not None:
         _execute_resume(run_id=resume, db_path=db, offline=offline)
     elif repo is not None:
-        _execute_new_run(repo_path=repo, db_path=db, offline=offline, model=model)
+        _execute_new_run(
+            repo_path=repo,
+            db_path=db,
+            offline=offline,
+            model=model,
+            bootstrap=bootstrap,
+            max_targets=max_targets,
+        )
     else:
         print_error("Missing required parameter: Either --repo <path> or --resume <run_id> must be specified.")
         raise typer.Exit(code=2)

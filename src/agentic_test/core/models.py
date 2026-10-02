@@ -88,6 +88,10 @@ class RepositorySnapshot(BaseModel):
     affected_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)
     deleted_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)
     syntax_errors: Tuple[str, ...] = Field(default_factory=tuple)
+    all_symbols: Tuple[SymbolContract, ...] = Field(
+        default_factory=tuple,
+        description="All parsed public application symbols discovered in repository.",
+    )
 
 
 class WorkflowRoute(str, Enum):

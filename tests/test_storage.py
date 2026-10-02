@@ -1679,3 +1679,76 @@ def test_event_store_and_repository_coexistence() -> None:
         assert len(repo.get_run_evidence("run-coexist")) == 1
     finally:
         conn.close()
+
+
+def test_checkpoint_roundtrip_bootstrap_mode() -> None:
+    """Verifies that WorkflowState with bootstrap mode and all_symbols persists and recovers accurately."""
+    from agentic_test.core.models import RepositorySnapshot, SymbolContract, SymbolType
+
+    conn = init_database(":memory:")
+    try:
+        repo = SQLiteRepository(conn)
+        store = SQLiteEventStore(conn)
+
+        run_id = "run-bootstrap-storage"
+        repo.save_run(
+            run_id=run_id,
+            repo_path="/workspace/repo",
+            current_commit="c123",
+            base_commit="b123",
+            branch_name="feat/cold-start",
+        )
+
+        sym = SymbolContract(
+            qualified_name="pkg.utils.helper",
+            symbol_type=SymbolType.FUNCTION,
+            file_path=Path("pkg/utils.py"),
+            line_range=(10, 20),
+            signature="def helper(x: int) -> int",
+        )
+        snapshot = RepositorySnapshot(
+            repo_path=Path("/workspace/repo"),
+            current_commit="c123",
+            base_commit="b123",
+            branch_name="feat/cold-start",
+            source_tree_hash="sha256:" + "0" * 64,
+            is_valid=True,
+            all_symbols=(sym,),
+        )
+        state = WorkflowState(
+            run_id=run_id,
+            repo_path=Path("/workspace/repo"),
+            bootstrap=True,
+            max_targets=7,
+            snapshot=snapshot,
+        )
+
+        # 1. Save checkpoint
+        repo.save_checkpoint(state=state, step_index=1, node_name="ingest_and_analyze_node")
+
+        # 2. Retrieve checkpoint
+        latest_cp = repo.get_latest_checkpoint(run_id)
+        assert latest_cp is not None
+        assert latest_cp.step_index == 1
+        assert latest_cp.node_name == "ingest_and_analyze_node"
+
+        # 3. Assert full fidelity of reconstructed state
+        recovered = latest_cp.state
+        assert recovered.bootstrap is True
+        assert recovered.max_targets == 7
+        assert recovered.snapshot is not None
+        assert len(recovered.snapshot.all_symbols) == 1
+        assert recovered.snapshot.all_symbols[0].qualified_name == "pkg.utils.helper"
+
+        # 4. Check CONFIG_MODE event emission in event store
+        store.emit_event(
+            run_id=run_id,
+            event_type="CONFIG_MODE",
+            payload={"offline": False, "bootstrap": True, "max_targets": 7},
+        )
+        events = store.get_events(run_id, event_type="CONFIG_MODE")
+        assert len(events) == 1
+        assert events[0].payload == {"offline": False, "bootstrap": True, "max_targets": 7}
+    finally:
+        conn.close()
+

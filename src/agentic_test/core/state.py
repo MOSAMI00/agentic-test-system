@@ -48,6 +48,10 @@ class WorkflowState(BaseModel):
     # --- Populated during Failure Diagnosis (UC-06) ---
     diagnoses: Tuple[FailureDiagnosis, ...] = Field(default_factory=tuple)
 
+    # --- Operational Modes & Configuration ---
+    bootstrap: bool = False
+    max_targets: int = 5
+
     # --- Terminal Execution Status ---
     final_status: str = "INITIALIZED"
     error_message: Optional[str] = None

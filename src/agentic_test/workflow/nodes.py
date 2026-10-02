@@ -49,7 +49,14 @@ def plan_execution_node(
     """
     if state.snapshot is None:
         raise ValueError("RepositorySnapshot is required for plan_execution_node")
-    plan: ExecutionPlan = planner.plan(state.snapshot)
+    if state.bootstrap:
+        plan: ExecutionPlan = planner.plan(
+            state.snapshot,
+            bootstrap=state.bootstrap,
+            max_targets=state.max_targets,
+        )
+    else:
+        plan = planner.plan(state.snapshot)
     return state.model_copy(update={"plan": plan})
 
 

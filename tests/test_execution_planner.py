@@ -28,6 +28,7 @@ from agentic_test.core.models import (
 from agentic_test.planning.planner import ExecutionPlanner
 from agentic_test.planning.rules import (
     compute_decision_hash,
+    evaluate_bootstrap_rules,
     order_symbols_structurally,
 )
 
@@ -79,6 +80,7 @@ def _make_snapshot(
     existing_test_files: Tuple[Path, ...] = (),
     source_tree_hash: str = "a" * 64,
     deleted_symbols: Tuple[SymbolContract, ...] = (),
+    all_symbols: Tuple[SymbolContract, ...] = (),
 ) -> RepositorySnapshot:
     """Helper to create a validated RepositorySnapshot."""
     return RepositorySnapshot(
@@ -95,6 +97,7 @@ def _make_snapshot(
         affected_symbols=affected_symbols,
         deleted_symbols=deleted_symbols,
         syntax_errors=(),
+        all_symbols=all_symbols,
     )
 
 
@@ -952,3 +955,199 @@ def test_deleted_symbols_never_leak_into_target_symbols(tmp_path: Path) -> None:
     assert plan.target_symbols == (sym_surviving_uncovered,)
     assert del_1 not in plan.target_symbols
     assert del_2 not in plan.target_symbols
+
+
+def test_bootstrap_clean_tree_uncovered_symbols_routes_to_generation(tmp_path: Path) -> None:
+    """Verifies bootstrap mode targets uncovered symbols on a clean repository without diffs."""
+    sym_add = SymbolContract(
+        qualified_name="calc.add",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(1, 5),
+        signature="def add(a, b)",
+    )
+    sym_sub = SymbolContract(
+        qualified_name="calc.sub",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(6, 10),
+        signature="def sub(a, b)",
+    )
+    sym_mul = SymbolContract(
+        qualified_name="calc.mul",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(11, 15),
+        signature="def mul(a, b)",
+    )
+
+    test_file = Path("tests/test_calc.py")
+    assoc_add = StaticAssociation(
+        target_symbol="calc.add",
+        test_file_path=test_file,
+        classification=AssociationClassification.STATICALLY_ASSOCIATED,
+        evidence_kind=EvidenceKind.DIRECT_CALL,
+        reason="Direct call to add",
+    )
+
+    mock_discovery = MockTestDiscovery([assoc_add])
+    planner = ExecutionPlanner(test_discovery=mock_discovery)
+
+    # Clean working tree: zero diff hunks, zero affected_symbols
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(),
+        affected_symbols=(),
+        deleted_symbols=(),
+        all_symbols=(sym_add, sym_sub, sym_mul),
+        existing_test_files=(test_file,),
+    )
+
+    # Standard mode routes to NO_OP because diff is empty (Rule P1)
+    standard_plan = planner.plan(snapshot)
+    assert standard_plan.route == WorkflowRoute.ROUTE_NO_OP
+    assert standard_plan.target_symbols == ()
+
+    # Bootstrap mode routes to TEST_GENERATION for the uncovered symbols
+    bootstrap_plan = planner.plan(snapshot, bootstrap=True, max_targets=5)
+    assert bootstrap_plan.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+    assert set(s.qualified_name for s in bootstrap_plan.target_symbols) == {"calc.sub", "calc.mul"}
+    assert bootstrap_plan.existing_tests_to_run == (test_file,)
+    assert "Bootstrap mode" in bootstrap_plan.rationale
+
+
+def test_bootstrap_respects_max_targets(tmp_path: Path) -> None:
+    """Verifies bootstrap mode caps the selected target symbols to max_targets."""
+    symbols = tuple(
+        SymbolContract(
+            qualified_name=f"module.func_{i}",
+            symbol_type=SymbolType.FUNCTION,
+            file_path=Path("src/mod.py"),
+            line_range=(i * 5, i * 5 + 4),
+            signature=f"def func_{i}()",
+        )
+        for i in range(10)
+    )
+
+    planner = ExecutionPlanner(test_discovery=MockTestDiscovery([]))
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(),
+        affected_symbols=(),
+        all_symbols=symbols,
+    )
+
+    plan = planner.plan(snapshot, bootstrap=True, max_targets=3)
+    assert plan.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+    assert len(plan.target_symbols) == 3
+
+
+def test_bootstrap_all_symbols_covered_routes_to_noop(tmp_path: Path) -> None:
+    """Verifies bootstrap mode routes to ROUTE_NO_OP when all symbols possess test associations."""
+    sym = SymbolContract(
+        qualified_name="calc.add",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(1, 5),
+        signature="def add(a, b)",
+    )
+    test_file = Path("tests/test_calc.py")
+    assoc = StaticAssociation(
+        target_symbol="calc.add",
+        test_file_path=test_file,
+        classification=AssociationClassification.STATICALLY_ASSOCIATED,
+        evidence_kind=EvidenceKind.DIRECT_CALL,
+        reason="Direct call to add",
+    )
+
+    planner = ExecutionPlanner(test_discovery=MockTestDiscovery([assoc]))
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(),
+        affected_symbols=(),
+        all_symbols=(sym,),
+        existing_test_files=(test_file,),
+    )
+
+    plan = planner.plan(snapshot, bootstrap=True)
+    assert plan.route == WorkflowRoute.ROUTE_NO_OP
+    assert "Bootstrap scan complete: all 1 application symbols possess positive test associations" in plan.rationale
+
+
+def test_bootstrap_empty_repository_routes_to_noop(tmp_path: Path) -> None:
+    """Verifies bootstrap mode routes to ROUTE_NO_OP when repository has no symbols."""
+    planner = ExecutionPlanner(test_discovery=MockTestDiscovery([]))
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(),
+        affected_symbols=(),
+        all_symbols=(),
+    )
+
+    plan = planner.plan(snapshot, bootstrap=True)
+    assert plan.route == WorkflowRoute.ROUTE_NO_OP
+    assert "Bootstrap scan found no application symbols" in plan.rationale
+
+
+def test_bootstrap_independent_of_non_code_diff_hunks(tmp_path: Path) -> None:
+    """Verifies bootstrap mode is independent of non-code diff hunks (Rule P2) and dirty working trees."""
+    sym = SymbolContract(
+        qualified_name="calc.uncovered_func",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("src/calc.py"),
+        line_range=(1, 5),
+        signature="def uncovered_func()",
+    )
+    # Diff hunk modifying README.md (which would trigger Rule P2 ROUTE_NO_OP in diff mode)
+    doc_diff = _make_diff_hunk(file_path=Path("README.md"), old_lines=1, new_lines=1)
+
+    planner = ExecutionPlanner(test_discovery=MockTestDiscovery([]))
+    snapshot = _make_snapshot(
+        repo_path=tmp_path,
+        diff_hunks=(doc_diff,),
+        affected_symbols=(),
+        all_symbols=(sym,),
+    )
+
+    # Standard diff mode routes to NO_OP via Rule P2 (non-code only)
+    diff_plan = planner.plan(snapshot, bootstrap=False)
+    assert diff_plan.route == WorkflowRoute.ROUTE_NO_OP
+    assert "Non-code modifications only" in diff_plan.rationale
+
+    # Bootstrap mode evaluates all_symbols independently and routes to TEST_GENERATION
+    bootstrap_plan = planner.plan(snapshot, bootstrap=True, max_targets=5)
+    assert bootstrap_plan.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+    assert bootstrap_plan.target_symbols == (sym,)
+    assert "Bootstrap mode" in bootstrap_plan.rationale
+
+
+def test_evaluate_bootstrap_rules_direct() -> None:
+    """Directly tests evaluate_bootstrap_rules routing decision logic."""
+    sym1 = SymbolContract(
+        qualified_name="app.covered",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("app.py"),
+        line_range=(1, 5),
+        signature="def covered()",
+    )
+    sym2 = SymbolContract(
+        qualified_name="app.uncovered",
+        symbol_type=SymbolType.FUNCTION,
+        file_path=Path("app.py"),
+        line_range=(6, 10),
+        signature="def uncovered()",
+    )
+
+    test_file = Path("tests/test_app.py")
+    decision = evaluate_bootstrap_rules(
+        all_symbols=[sym1, sym2],
+        positively_associated_symbols={"app.covered"},
+        symbol_to_test_files={"app.covered": {test_file}},
+        max_bootstrap_targets=5,
+    )
+
+    assert decision.route == WorkflowRoute.ROUTE_TO_TEST_GENERATION
+    assert decision.target_symbols == (sym2,)
+    assert decision.existing_tests_to_run == (test_file,)
+
+

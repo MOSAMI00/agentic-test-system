@@ -196,6 +196,7 @@ class AnalysisService:
             affected_symbols=tuple(affected_symbols),
             deleted_symbols=tuple(deleted_symbols),
             syntax_errors=tuple(syntax_errors),
+            all_symbols=tuple(all_symbols),
         )
 
     @staticmethod

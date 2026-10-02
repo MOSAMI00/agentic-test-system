@@ -89,6 +89,8 @@ def test_cli_run_help(runner: CliRunner) -> None:
     assert "--repo" in result.stdout
     assert "--resume" in result.stdout
     assert "--db" in result.stdout
+    assert "--bootstrap" in result.stdout
+    assert "--max-targets" in result.stdout
 
 
 def test_cli_run_missing_args(runner: CliRunner) -> None:
@@ -535,3 +537,45 @@ def test_cli_package_main_entry_point() -> None:
     """Verifies that `agentic_test.cli.__main__` module exposes a callable entry point."""
     import agentic_test.cli.__main__ as cli_main
     assert callable(cli_main.main)
+
+
+def test_cli_run_bootstrap_mode(runner: CliRunner, git_repo: Path, db_path: Path) -> None:
+    """Verifies --bootstrap and --max-targets configure initial WorkflowState and event correctly."""
+    captured_initial_state: list[WorkflowState] = []
+
+    def mock_factory(db_path: Path, repo_path: Path, **kwargs: object) -> MagicMock:
+        mock_engine = MagicMock(spec=WorkflowEngine)
+
+        def mock_run(state: WorkflowState) -> WorkflowState:
+            captured_initial_state.append(state)
+            return state.model_copy(update={"final_status": "COMPLETED"})
+
+        mock_engine.run.side_effect = mock_run
+        return mock_engine
+
+    set_engine_factory(mock_factory)
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--repo", str(git_repo),
+            "--db", str(db_path),
+            "--offline",
+            "--bootstrap",
+            "--max-targets", "3",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(captured_initial_state) == 1
+    assert captured_initial_state[0].bootstrap is True
+    assert captured_initial_state[0].max_targets == 3
+
+    # Check CONFIG_MODE event in database
+    conn = init_database(db_path)
+    event_store = SQLiteEventStore(conn)
+    events = event_store.get_events(captured_initial_state[0].run_id, event_type="CONFIG_MODE")
+    assert len(events) == 1
+    assert events[0].payload == {"offline": True, "bootstrap": True, "max_targets": 3}
+
