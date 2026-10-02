@@ -235,3 +235,90 @@ def test_export_run_artifacts_graceful_on_invalid_repo() -> None:
     )
     result = export_run_artifacts(state)
     assert result is None
+
+
+def test_export_run_artifacts_quarantine_isolation_and_reporting(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "quarantine_repo"
+    repo_dir.mkdir()
+
+    # 1. Valid passed candidate
+    cand_passed = TestCandidate(
+        candidate_id="tc-pass",
+        run_id="run-quarantine-test",
+        target_symbol_name="safe_module.safe_func",
+        test_file_path=Path("tests/test_safe.py"),
+        candidate_code="def test_safe_func(): assert safe_func() is True",
+        imports=("from safe_module import safe_func",),
+        validation_status=ValidationStatus.PASSED,
+    )
+
+    # 2. Rejected candidate (e.g. security rejection containing dangerous imports)
+    cand_quarantined = TestCandidate(
+        candidate_id="tc-quarantine",
+        run_id="run-quarantine-test",
+        target_symbol_name="dangerous_module.exec_cmd",
+        test_file_path=Path("tests/test_danger.py"),
+        candidate_code="def test_eval(): import os; os.system('echo dangerous')",
+        imports=("import os",),
+        validation_status=ValidationStatus.REJECTED_SECURITY,
+        quarantine_reason="Gate 2 Security: Prohibited call to os.system",
+    )
+
+    state = WorkflowState(
+        run_id="run-quarantine-test",
+        repo_path=repo_dir,
+        candidates=(cand_passed, cand_quarantined),
+        final_status="COMPLETED",
+    )
+
+    run_dir = export_run_artifacts(state)
+    assert run_dir is not None
+
+    candidates_dir = run_dir / "candidates"
+    quarantine_dir = run_dir / "quarantine"
+    assert candidates_dir.exists()
+    assert quarantine_dir.exists()
+
+    # Passed candidate MUST be in candidates/ with test_*.py
+    passed_file = candidates_dir / "test_safe_module_safe_func_tc-pass.py"
+    assert passed_file.exists()
+    assert "def test_safe_func():" in passed_file.read_text(encoding="utf-8")
+
+    # Quarantined candidate MUST NOT be in candidates/
+    assert not (candidates_dir / "test_dangerous_module_exec_cmd_tc-quarantine.py").exists()
+
+    # Quarantined candidate MUST be in quarantine/ with .py.txt extension
+    quarantined_file = quarantine_dir / "quarantined_dangerous_module_exec_cmd_tc-quarantine.py.txt"
+    assert quarantined_file.exists()
+    q_content = quarantined_file.read_text(encoding="utf-8")
+    assert "Gate 2 Security: Prohibited call to os.system" in q_content
+    assert "WARNING: This candidate was quarantined/rejected from execution." in q_content
+    assert "def test_eval():" in q_content
+
+    # The quarantined file must NOT match pytest test discovery patterns
+    assert not quarantined_file.name.startswith("test_")
+    assert not quarantined_file.name.endswith(".py")
+    assert quarantined_file.name.endswith(".py.txt")
+
+    # Check report.md content
+    report_text = (run_dir / "report.md").read_text(encoding="utf-8")
+
+    # Executive Summary distinction
+    assert "Passed (Validated) Candidates" in report_text
+    assert "Exported Executable Tests" in report_text
+    assert "Quarantined Review Artifacts" in report_text
+
+    # Section 2 separation
+    assert "### Validated & Executable Tests (`candidates/`)" in report_text
+    assert "[`candidates/test_safe_module_safe_func_tc-pass.py`](./candidates/test_safe_module_safe_func_tc-pass.py)" in report_text
+
+    assert "### Quarantined Artifacts for Review (`quarantine/`)" in report_text
+    assert "[`quarantine/quarantined_dangerous_module_exec_cmd_tc-quarantine.py.txt`](./quarantine/quarantined_dangerous_module_exec_cmd_tc-quarantine.py.txt)" in report_text
+
+    # Section 3 quarantine details table link
+    assert "Quarantined Artifact" in report_text
+    assert "Gate 2 Security: Prohibited call to os.system" in report_text
+
+    # Section 4 table link
+    assert "[`quarantine/quarantined_dangerous_module_exec_cmd_tc-quarantine.py.txt`](./quarantine/quarantined_dangerous_module_exec_cmd_tc-quarantine.py.txt)" in report_text
+

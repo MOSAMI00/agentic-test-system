@@ -49,34 +49,46 @@ def export_run_artifacts(state: WorkflowState) -> Optional[Path]:
     agentic_root = repo_root / ".agentic_test"
     run_dir = agentic_root / "runs" / run_id
     candidates_dir = run_dir / "candidates"
+    quarantine_dir = run_dir / "quarantine"
 
-    candidates_dir.mkdir(parents=True, exist_ok=True)
+    # 1. Export candidate files based on validation status
+    # Passed candidates go to candidates/ with test_*.py
+    # Quarantined / rejected candidates with code go to quarantine/ with quarantined_*.py.txt
+    passed_files: List[Tuple[str, Path, TestCandidate]] = []
+    quarantined_files: List[Tuple[str, Path, TestCandidate]] = []
 
-    # 1. Export candidate python files
-    exported_files: List[Tuple[str, Path, TestCandidate]] = []
     for candidate in state.candidates:
         if candidate.candidate_code and candidate.candidate_code.strip():
             clean_target = sanitize_identifier(candidate.target_symbol_name)
-            file_name = f"test_{clean_target}_{candidate.candidate_id}.py"
-            file_path = candidates_dir / file_name
-
             file_content = _assemble_candidate_file(candidate, run_id)
-            file_path.write_text(file_content, encoding="utf-8")
-            exported_files.append((file_name, file_path, candidate))
+
+            if candidate.validation_status == ValidationStatus.PASSED:
+                candidates_dir.mkdir(parents=True, exist_ok=True)
+                file_name = f"test_{clean_target}_{candidate.candidate_id}.py"
+                file_path = candidates_dir / file_name
+                file_path.write_text(file_content, encoding="utf-8")
+                passed_files.append((f"candidates/{file_name}", file_path, candidate))
+            else:
+                quarantine_dir.mkdir(parents=True, exist_ok=True)
+                file_name = f"quarantined_{clean_target}_{candidate.candidate_id}.py.txt"
+                file_path = quarantine_dir / file_name
+                file_path.write_text(file_content, encoding="utf-8")
+                quarantined_files.append((f"quarantine/{file_name}", file_path, candidate))
 
     # 2. Generate and write report.md
     report_path = run_dir / "report.md"
-    report_content = _generate_report_markdown(state, exported_files)
+    report_content = _generate_report_markdown(state, passed_files, quarantined_files)
+    run_dir.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report_content, encoding="utf-8")
 
     return run_dir
 
 
 def _assemble_candidate_file(candidate: TestCandidate, run_id: str) -> str:
-    """Assembles runnable Python test file with metadata docstring, imports, and test code."""
+    """Assembles Python test or quarantined artifact file with metadata docstring, imports, and test code."""
     header = [
         '"""',
-        f"Auto-generated unit test candidate by Agentic Test Generation System.",
+        "Auto-generated unit test candidate by Agentic Test Generation System.",
         f"Run ID:            {run_id}",
         f"Candidate ID:      {candidate.candidate_id}",
         f"Target Symbol:     {candidate.target_symbol_name}",
@@ -84,6 +96,9 @@ def _assemble_candidate_file(candidate: TestCandidate, run_id: str) -> str:
     ]
     if candidate.quarantine_reason:
         header.append(f"Quarantine Reason: {candidate.quarantine_reason}")
+    if candidate.validation_status != ValidationStatus.PASSED:
+        header.append("WARNING: This candidate was quarantined/rejected from execution.")
+        header.append("Saved as a non-executable artifact (.py.txt) for manual audit only.")
     header.append('"""\n')
 
     parts = ["\n".join(header)]
@@ -97,14 +112,17 @@ def _assemble_candidate_file(candidate: TestCandidate, run_id: str) -> str:
 
 def _generate_report_markdown(
     state: WorkflowState,
-    exported_files: List[Tuple[str, Path, TestCandidate]],
+    passed_files: List[Tuple[str, Path, TestCandidate]],
+    quarantined_files: List[Tuple[str, Path, TestCandidate]],
 ) -> str:
     """Generates the run execution summary Markdown report."""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     ev_map: Dict[str, ExecutionEvidence] = {
         ev.candidate_id: ev for ev in state.evidences if ev.candidate_id
     }
-    file_name_by_cand = {cand.candidate_id: fn for fn, _, cand in exported_files}
+    all_exported = passed_files + quarantined_files
+    file_link_by_cand = {cand.candidate_id: rel_link for rel_link, _, cand in all_exported}
+    passed_candidates = [c for c in state.candidates if c.validation_status == ValidationStatus.PASSED]
 
     lines = [
         f"# Execution Report: `{state.run_id}`",
@@ -124,7 +142,9 @@ def _generate_report_markdown(
         f"| **Selected Route** | `{state.plan.route.value if state.plan else 'NONE'}` |",
         f"| **Target Symbols** | {len(state.plan.target_symbols) if state.plan else 0} |",
         f"| **Total Candidates** | {len(state.candidates)} |",
-        f"| **Exported Test Files** | {len(exported_files)} |",
+        f"| **Passed (Validated) Candidates** | {len(passed_candidates)} |",
+        f"| **Exported Executable Tests** | {len(passed_files)} |",
+        f"| **Quarantined Review Artifacts** | {len(quarantined_files)} |",
         f"| **Execution Evidences** | {len(state.evidences)} |",
         f"| **Failure Diagnoses** | {len(state.diagnoses)} |",
         "",
@@ -132,12 +152,14 @@ def _generate_report_markdown(
         "",
         "## 2. Exported Test Candidate Files",
         "",
+        "### Validated & Executable Tests (`candidates/`)",
+        "",
     ]
 
     # 2. Exported Candidates List (Placed immediately after Executive Summary)
-    if exported_files:
-        lines.append("The following runnable test candidate files were generated and saved:")
-        for fn, fp, c in exported_files:
+    if passed_files:
+        lines.append("The following test files passed all validation gates and are runnable:")
+        for rel_link, fp, c in passed_files:
             ev = ev_map.get(c.candidate_id)
             status_parts = []
             if ev is not None:
@@ -148,9 +170,24 @@ def _generate_report_markdown(
             else:
                 status_parts.append("Status: " + c.validation_status.value)
             status_desc = ", ".join(status_parts)
-            lines.append(f"- [`candidates/{fn}`](./candidates/{fn}) — Target: `{c.target_symbol_name}` ({status_desc})")
+            lines.append(f"- [`{rel_link}`](./{rel_link}) — Target: `{c.target_symbol_name}` ({status_desc})")
     else:
-        lines.append("No executable test candidate files were exported for this run.")
+        lines.append("No executable test candidate files passed validation for this run.")
+    lines.append("")
+
+    lines.extend([
+        "### Quarantined Artifacts for Review (`quarantine/`)",
+        "",
+    ])
+    if quarantined_files:
+        lines.append(
+            "The following candidate files were rejected during generation or validation gates and are preserved for audit with a non-executable `.py.txt` extension to prevent accidental test collection:"
+        )
+        for rel_link, fp, c in quarantined_files:
+            reason = c.quarantine_reason or "Validation rejected"
+            lines.append(f"- [`{rel_link}`](./{rel_link}) — Target: `{c.target_symbol_name}` (Status: `{c.validation_status.value}`, Reason: {reason})")
+    else:
+        lines.append("No candidate files were quarantined.")
     lines.append("")
 
     # 3. Process Errors & Diagnostics Alerts
@@ -204,11 +241,18 @@ def _generate_report_markdown(
         lines.extend([
             "### Generation & Validation Quarantine Details",
             "",
-            "| Candidate ID | Target Symbol | Validation Status | Quarantine / Failure Reason |",
-            "| :--- | :--- | :--- | :--- |",
+            "| Candidate ID | Target Symbol | Validation Status | Quarantine / Failure Reason | Quarantined Artifact |",
+            "| :--- | :--- | :--- | :--- | :--- |",
         ])
         for c in quarantined_cands:
-            lines.append(f"| `{c.candidate_id}` | `{c.target_symbol_name}` | `{c.validation_status.value}` | {c.quarantine_reason or '-'} |")
+            link_str = (
+                f"[`{file_link_by_cand[c.candidate_id]}`](./{file_link_by_cand[c.candidate_id]})"
+                if c.candidate_id in file_link_by_cand
+                else "-"
+            )
+            lines.append(
+                f"| `{c.candidate_id}` | `{c.target_symbol_name}` | `{c.validation_status.value}` | {c.quarantine_reason or '-'} | {link_str} |"
+            )
         lines.append("")
 
     # E. Execution Failures
@@ -270,9 +314,9 @@ def _generate_report_markdown(
         exit_code_str = str(ev.exit_code) if ev is not None else "-"
         timed_out_str = "**YES**" if (ev is not None and (ev.timed_out or ev.exit_code == 124)) else ("No" if ev is not None else "-")
         dur_str = f"{ev.duration_sec:.2f}s" if ev is not None else "-"
-        if c.candidate_id in file_name_by_cand:
-            fn = file_name_by_cand[c.candidate_id]
-            fn_str = f"[`candidates/{fn}`](./candidates/{fn})"
+        if c.candidate_id in file_link_by_cand:
+            rel_link = file_link_by_cand[c.candidate_id]
+            fn_str = f"[`{rel_link}`](./{rel_link})"
         else:
             fn_str = "-"
         reason_str = c.quarantine_reason or "-"
