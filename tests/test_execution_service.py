@@ -1427,3 +1427,17 @@ def test_bounded_settings_cache_eviction(source_dir: Path) -> None:
     # Latest 50 entries (5 to 54) should be present
     for i in range(5, 55):
         assert service.get_evidence_settings(f"ev-{i:03d}") is not None
+
+
+def test_execution_service_includes_src_layout_in_pythonpath(tmp_path: Path) -> None:
+    """Verifies that ExecutionService includes /workspace/src/src in PYTHONPATH when src/ exists."""
+    sandbox = SimulatedContainerSandboxManager()
+    source_dir = tmp_path / "repo_root"
+    source_dir.mkdir()
+    (source_dir / "src").mkdir()
+
+    service = ExecutionService(sandbox_manager=sandbox, source_root=source_dir)
+    env = service._build_container_env()
+    assert "/workspace/src/src" in env["PYTHONPATH"]
+    assert "/workspace/src" in env["PYTHONPATH"]
+    assert env["PYTHONPATH"].startswith("/workspace/src/src:")

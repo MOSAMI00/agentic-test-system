@@ -84,6 +84,44 @@ class CollectionValidator(BaseValidator):
     def runner(self) -> PytestRunner:
         return self._runner
 
+    def _build_container_env(self) -> Dict[str, str]:
+        """
+        Builds the environment dictionary for the container, ensuring PYTHONPATH includes
+        the workspace, repository root, source tree (/workspace/src/src), and any custom
+        pythonpaths defined in pyproject.toml.
+        """
+        env_vars = dict(self._environment_vars)
+        python_paths = ["/workspace/src", "/workspace"]
+        if self._source_root is not None and self._source_root.is_dir():
+            # If target repo has a src/ directory, include it in PYTHONPATH
+            if (self._source_root / "src").is_dir():
+                python_paths.insert(0, "/workspace/src/src")
+            # If pyproject.toml defines custom pytest pythonpath, include those paths too
+            pyproject_file = self._source_root / "pyproject.toml"
+            if pyproject_file.is_file():
+                try:
+                    try:
+                        import tomllib
+                    except ImportError:
+                        import tomli as tomllib  # type: ignore[no-redef]
+                    with open(pyproject_file, "rb") as f:
+                        data = tomllib.load(f)
+                    custom_paths = data.get("tool", {}).get("pytest", {}).get("ini_options", {}).get("pythonpath", [])
+                    if isinstance(custom_paths, list):
+                        for cp in custom_paths:
+                            container_p = f"/workspace/src/{cp.strip('/')}"
+                            if container_p not in python_paths:
+                                python_paths.insert(0, container_p)
+                except Exception:
+                    pass
+
+        base_pythonpath = ":".join(python_paths)
+        if "PYTHONPATH" not in env_vars:
+            env_vars["PYTHONPATH"] = base_pythonpath
+        else:
+            env_vars["PYTHONPATH"] = f"{base_pythonpath}:{env_vars['PYTHONPATH']}"
+        return env_vars
+
     def validate(
         self,
         candidate: TestCandidate,
@@ -150,11 +188,7 @@ class CollectionValidator(BaseValidator):
                 read_only_mounts[self._source_root] = "/workspace/src"
 
             # 3. Environment variables (set PYTHONPATH to include source tree and workspace)
-            env_vars = dict(self._environment_vars)
-            if "PYTHONPATH" not in env_vars:
-                env_vars["PYTHONPATH"] = "/workspace/src:/workspace"
-            else:
-                env_vars["PYTHONPATH"] = f"/workspace/src:/workspace:{env_vars['PYTHONPATH']}"
+            env_vars = self._build_container_env()
 
             # 4. Construct deterministic collection command via PytestRunner
             cmd = self._runner.construct_collection_command("/workspace/tests")

@@ -364,3 +364,20 @@ def test_collection_sandbox_confinement_policies(tmp_path: Path) -> None:
     assert config.cpu_quota == 1.0
     assert config.pids_limit == 100
     assert "PYTHONPATH" in config.environment_vars
+
+
+def test_collection_validator_includes_src_layout_in_pythonpath(tmp_path: Path) -> None:
+    """Verifies that CollectionValidator includes /workspace/src/src in PYTHONPATH when src/ exists."""
+    sandbox = MockSandboxManager()
+    source_dir = tmp_path / "repo_root"
+    source_dir.mkdir()
+    (source_dir / "src").mkdir()
+
+    validator = CollectionValidator(
+        sandbox_manager=sandbox,
+        source_root=source_dir,
+    )
+    env = validator._build_container_env()
+    assert "/workspace/src/src" in env["PYTHONPATH"]
+    assert "/workspace/src" in env["PYTHONPATH"]
+    assert env["PYTHONPATH"].startswith("/workspace/src/src:")
