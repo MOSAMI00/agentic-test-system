@@ -26,11 +26,11 @@ Iteration 1.4 ──> verify ──> Iteration 1.5 ──> verify ──> Iterat
 
 | Iteration / Workstream | Implementation Status | Readiness & Blocker Details |
 | :--- | :---: | :--- |
-| **Iteration 1.1: Core Infrastructure & Ingestion** | **COMPLETED & VERIFIED — pending no further 1.1 work; Gate 3, test-to-symbol mapping, and multi-candidate evidence remain open for later iterations.** | Implemented in dedicated repo `agentic-test-system` (39 tests passing, 95% coverage, strict mypy 0 issues). Decision A (remote origin via `GitService.get_remote_origin()`, unpersisted in `RepositorySnapshot`), Decision B (deep collection immutability via `Tuple[T, ...]` replacing `List[T]` for NFR-06), FR-02 binary exclusion, and human-approved Option 1 clarification for FR-01 configuration clause (standard Git layout validation) fully verified. |
+| **Iteration 1.1: Core Infrastructure & Ingestion** | **COMPLETED & VERIFIED — pending no further 1.1 work; Gate 3 and test-to-symbol mapping remain open for later iterations.** | Implemented in dedicated repo `agentic-test-system` (39 tests passing, 95% coverage, strict mypy 0 issues). Decision A (remote origin via `GitService.get_remote_origin()`, unpersisted in `RepositorySnapshot`), Decision B (deep collection immutability via `Tuple[T, ...]` replacing `List[T]` for NFR-06), FR-02 binary exclusion, human-approved Option 1 clarification for FR-01 configuration clause (standard Git layout validation), and Component 01 Sign-Off ratifications (**F-01**, **F-02**, **F-03**) closing Open Question #2 fully verified. |
 | **Iteration 1.2: AST Parsing & Symbol Mapping** | **BLOCKED (Design Heuristic Required)** | Blocked on Open Question #4 (test-to-symbol mapping heuristic) and dependency on Iteration 1.1 models. *Note: `affected_symbols` is populated during this iteration.* |
 | **Iteration 1.3: Deterministic Planning Gate** | **READY (Specification-Aligned)** | Pure Python routing rules P1–P4 and route precedence logic fully defined; blocked only by dependency on Iterations 1.1/1.2. |
 | **Iteration 1.4: Generation & Multi-Gate Validation** | **BLOCKED (Safety Invariant Conflict)** | Gate 3 host-side `pytest --collect-only` conflicts with host execution prohibition (`INV-01`, `RSK-02`). Kept strictly blocked pending human security decision. |
-| **Iteration 1.5: Docker Sandbox & Coverage** | **BLOCKED (State Modeling Decision Required)** | Blocked on Open Question #2 (`WorkflowState.evidence` 1:1 vs. 1:N multi-candidate evidence association). |
+| **Iteration 1.5: Docker Sandbox & Coverage** | **RESOLVED (Open Question #2 Closed via F-02 & F-03)** | Open Question #2 formally closed via human architectural ratification of `ExecutionEvidence` nullable/delta fields (**F-02**) and `WorkflowState.baseline_evidence` + `WorkflowState.evidences` (**F-03**). |
 | **Iteration 1.6: Dual-Engine Triage & CLI** | **READY (Specification-Aligned)** | 7-category taxonomy, SQLite schema, LangGraph state machine, and Typer CLI fully specified; dependent on upstream iterations. |
 
 ---
@@ -61,10 +61,10 @@ Iteration 1.4 ──> verify ──> Iteration 1.5 ──> verify ──> Iterat
   - `tests/test_state_models.py`
 - **Dependencies on Previous Iterations**: None (Entry baseline).
 - **Required Classes / Interfaces**:
-  - `RepositorySnapshot` (Pydantic model; Stage 2 Section 4.3.3 clarified via Option A and Decision B: preserves the 9 baseline fields, and adds `diff_hunks: Tuple[DiffHunk, ...] = Field(default_factory=tuple)`, `affected_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)`, and `syntax_errors: Tuple[str, ...] = Field(default_factory=tuple)` as immutable, typed fields with empty-tuple defaults). Collection fields use `Tuple[T, ...]` for deep immutability under `NFR-06`.
+  - `RepositorySnapshot` (Pydantic model; Stage 2 Section 4.3.3 clarified via Option A, Decision B, and Component 01 Ratification F-01: preserves the 9 baseline fields, and adds `diff_hunks: Tuple[DiffHunk, ...] = Field(default_factory=tuple)`, `affected_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)`, `deleted_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)`, and `syntax_errors: Tuple[str, ...] = Field(default_factory=tuple)` as immutable, typed fields with empty-tuple defaults). Collection fields use `Tuple[T, ...]` / `tuple[T, ...]` for deep immutability under `NFR-06`.
   - `DiffHunk` (Pydantic value object; Stage 2 Section 4.3.3, frozen=True)
   - `ChangeType` (Enum: `ADDED`, `MODIFIED`, `DELETED`)
-  - `WorkflowState` (Pydantic model; Stage 3 Section 4.4.3 clarified via Decision B: concrete typing for `plan: Optional[ExecutionPlan]`, `candidates: Tuple[TestCandidate, ...]`, `evidence: Optional[ExecutionEvidence]`, `diagnoses: Tuple[FailureDiagnosis, ...]`).
+  - `WorkflowState` (Pydantic model; Stage 3 Section 4.4.3 clarified via Decision B and Component 01 Ratification F-03: concrete typing for `plan: Optional[ExecutionPlan]`, `candidates: Tuple[TestCandidate, ...]`, `baseline_evidence: Optional[ExecutionEvidence]`, `evidences: Tuple[ExecutionEvidence, ...]`, `diagnoses: Tuple[FailureDiagnosis, ...]`, with legacy `evidence` migration validator and backward-compatible `.evidence` read property).
   - `GitService` (Class with methods: `validate_repository(path: Path) -> bool`, `get_head_commit() -> str`, `get_remote_origin() -> Optional[str]`, `compute_diff(base_commit: str) -> Tuple[DiffHunk, ...]`, `create_snapshot(...) -> RepositorySnapshot`)
   - `RepositoryValidationError` (Custom exception)
 - **Required Tests**:
@@ -286,7 +286,7 @@ Iteration 1.4 ──> verify ──> Iteration 1.5 ──> verify ──> Iterat
 - **Required Classes / Interfaces**:
   - `SandboxConfig`, `ExecutionRawResult` (Stage 3 Listing 4.2)
   - `SandboxManager` (Protocol; Stage 3 Listing 4.2)
-  - `ExecutionEvidence` (Entity; Stage 2 Section 4.3.3)
+  - `ExecutionEvidence` (Entity; Stage 2 Section 4.3.3 + Component 01 Ratification F-02: nullable `candidate_id`, `line_coverage`, `branch_coverage`, plus `line_coverage_delta` and `branch_coverage_delta`)
   - `DockerSandboxManager` (Concrete realization of `SandboxManager`)
   - `PytestRunner` (`construct_command`, `parse_test_outcomes`)
   - `CoverageExtractor` (`parse_coverage_json`, `calculate_deltas`)
@@ -393,9 +393,11 @@ The following implementation-relevant ambiguities and conflicts are evidenced di
   - Stage 2 Section 4.3.3 Figure 4.1 & Stage 3 Section 4.4.7.1.1 define the relational relationship as `test_candidates (1) ── (0..1) execution_evidence`.
   - In SQLite schema (Stage 3 Listing 4.4), `execution_evidence` has a foreign key `candidate_id TEXT NOT NULL REFERENCES test_candidates(candidate_id)`.
 - **Conflict**: When a run generates multiple test candidates across multiple affected symbols, a single `evidence: Optional[ExecutionEvidence]` field in `WorkflowState` cannot hold individual execution results for each candidate.
-- **Affected Classes / Files**: `WorkflowState` (`src/agentic_test/core/state.py`), `ExecutionService`, `DiagnosisService`.
-- **Implementation Impact**: Either `WorkflowState.evidence` must become a list/map (`evidence: List[ExecutionEvidence]` or `Dict[str, ExecutionEvidence]`), or `ExecutionEvidence` must represent an aggregate run evidence object with candidate-level breakdown.
-- **Blocking Status**: Kept open for Iteration 1.5; **BLOCKS Iteration 1.5 multi-candidate execution modeling** pending human decision.
+- **Affected Classes / Files**: `WorkflowState` (`src/agentic_test/core/state.py`), `ExecutionEvidence` (`src/agentic_test/core/models.py`), `ExecutionService`, `DiagnosisService`.
+- **Human Architectural Decision (Ratified Component 01 Sign-Off, 2026-11-27)**: **RESOLVED via F-02 and F-03**:
+  - **F-02 (Ratified):** `ExecutionEvidence` officially supports nullable `candidate_id: str | None = None` (for regression baseline/run-level evidence), nullable `line_coverage: float | None = None` and `branch_coverage: float | None = None`, plus `line_coverage_delta: float | None = None` and `branch_coverage_delta: float | None = None`.
+  - **F-03 (Ratified):** `WorkflowState` officially replaces singular `evidence` with `baseline_evidence: ExecutionEvidence | None = None` and plural `evidences: tuple[ExecutionEvidence, ...] = Field(default_factory=tuple)`, preserving backward compatibility via a `@model_validator(mode="before")` migrating legacy singular `evidence` inputs and a read-only `.evidence` property.
+- **Blocking Status**: **RESOLVED & CLOSED** (Component 01 Sign-Off).
 
 ### Question 3: Data Used by Analysis/Planning vs. Documented `RepositorySnapshot` Fields
 - **Evidenced Concept**:
@@ -435,11 +437,13 @@ The following implementation-relevant ambiguities and conflicts are evidenced di
     - `RepositorySnapshot.existing_test_files: Tuple[Path, ...] = Field(default_factory=tuple)`
     - `RepositorySnapshot.diff_hunks: Tuple[DiffHunk, ...] = Field(default_factory=tuple)`
     - `RepositorySnapshot.affected_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)`
+    - `RepositorySnapshot.deleted_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)` *(Ratified Component 01 Sign-Off, F-01)*
     - `RepositorySnapshot.syntax_errors: Tuple[str, ...] = Field(default_factory=tuple)`
     - `ExecutionPlan.target_symbols: Tuple[SymbolContract, ...] = Field(default_factory=tuple)`
     - `ExecutionPlan.existing_tests_to_run: Tuple[Path, ...] = Field(default_factory=tuple)`
     - `TestCandidate.imports: Tuple[str, ...] = Field(default_factory=tuple)`
     - `WorkflowState.candidates: Tuple[TestCandidate, ...] = Field(default_factory=tuple)`
+    - `WorkflowState.evidences: Tuple[ExecutionEvidence, ...] = Field(default_factory=tuple)` *(Ratified Component 01 Sign-Off, F-03)*
     - `WorkflowState.diagnoses: Tuple[FailureDiagnosis, ...] = Field(default_factory=tuple)`
   - Standard JSON array `[...]` serialization and round-trip validation are preserved.
   - Custom wrappers (`FrozenList`), proxies, and property systems are rejected.
