@@ -153,11 +153,12 @@ class WorkflowState(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     snapshot: Optional[RepositorySnapshot] = None
     plan: Optional[ExecutionPlan] = None
-    candidates: List[TestCandidate] = Field(default_factory=list)
+    candidates: Tuple[TestCandidate, ...] = Field(default_factory=tuple)
     generation_retry_count: int = 0
     max_generation_retries: int = 2
-    evidence: Optional[ExecutionEvidence] = None
-    diagnoses: List[FailureDiagnosis] = Field(default_factory=list)
+    baseline_evidence: Optional[ExecutionEvidence] = None
+    evidences: Tuple[ExecutionEvidence, ...] = Field(default_factory=tuple)
+    diagnoses: Tuple[FailureDiagnosis, ...] = Field(default_factory=tuple)
     final_status: str = "INITIALIZED"
     error_message: Optional[str] = None
 ```
@@ -165,6 +166,10 @@ class WorkflowState(BaseModel):
 ### State Rules:
 - Direct in-place mutation of `WorkflowState` attributes is prohibited. Transitions must return new state dictionaries or validated model copies.
 - State is transactionally snapshotted at every graph node boundary to SQLite using `SqliteSaver`.
+- **Human-Authorized Domain Model Ratifications (Component 01 Sign-Off, Section 15 Rule 9)**:
+  - **F-01**: `RepositorySnapshot.deleted_symbols` (`tuple[SymbolContract, ...]`) is officially approved.
+  - **F-02**: `ExecutionEvidence` nullable `candidate_id`, `line_coverage`, `branch_coverage`, plus `line_coverage_delta` and `branch_coverage_delta` are officially approved.
+  - **F-03**: `WorkflowState.baseline_evidence` and plural `WorkflowState.evidences` (with legacy singular `evidence` migration validator and backward-compatible `.evidence` read property) are officially approved, formally closing Open Question #2.
 
 ---
 

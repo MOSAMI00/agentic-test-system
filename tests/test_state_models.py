@@ -5,7 +5,8 @@ Verifies validation, immutability (NFR-06), serialization, and Option A defaults
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -487,7 +488,7 @@ def test_json_serialization_and_deserialization_immutability() -> None:
 
     json_str = snapshot.model_dump_json()
     # Verifies standard JSON array format [...]
-    assert '"tracked_files":["a.py","b.py"]' in json_str or '"tracked_files": ["a.py", "b.py"]' in json_str or 'a.py' in json_str
+    assert 'a.py' in json_str  # tracked_files appear in JSON
     assert '"syntax_errors":["error1","error2"]' in json_str or 'error1' in json_str
 
     deserialized = RepositorySnapshot.model_validate_json(json_str)
@@ -720,7 +721,7 @@ def test_workflow_state_legacy_singular_evidence_migration() -> None:
     )
 
     # 1. Constructor passing legacy evidence dictionary unpacking
-    legacy_kwargs: Dict[str, Any] = {
+    legacy_kwargs: dict[str, Any] = {
         "run_id": "run-leg-01",
         "repo_path": Path("/tmp/repo"),
         "evidence": ev,
@@ -746,7 +747,7 @@ def test_workflow_state_legacy_evidence_none_migration() -> None:
     """
     Legacy evidence=None migrates cleanly to empty evidences tuple.
     """
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "run_id": "run-none-01",
         "repo_path": Path("/tmp/repo"),
         "evidence": None,
@@ -761,13 +762,25 @@ def test_workflow_state_legacy_evidence_list_tuple_migration() -> None:
     Legacy evidence passed as list or tuple migrates to evidences tuple.
     """
     ev1 = ExecutionEvidence(
-        evidence_id="ev-1", run_id="r1", exit_code=0, stdout="", stderr="", duration_sec=0.1
+        evidence_id="ev-1",
+        run_id="r1",
+        candidate_id="cand-1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.1,
     )
     ev2 = ExecutionEvidence(
-        evidence_id="ev-2", run_id="r1", exit_code=1, stdout="", stderr="", duration_sec=0.2
+        evidence_id="ev-2",
+        run_id="r1",
+        candidate_id="cand-2",
+        exit_code=1,
+        stdout="",
+        stderr="",
+        duration_sec=0.2,
     )
 
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "run_id": "r1",
         "repo_path": Path("/tmp/repo"),
         "evidence": [ev1, ev2],
@@ -783,13 +796,25 @@ def test_workflow_state_rejects_conflicting_evidence_and_evidences() -> None:
     legacy 'evidence' and canonical 'evidences' are supplied.
     """
     ev1 = ExecutionEvidence(
-        evidence_id="ev-1", run_id="r1", exit_code=0, stdout="", stderr="", duration_sec=0.1
+        evidence_id="ev-1",
+        run_id="r1",
+        candidate_id="cand-1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.1,
     )
     ev2 = ExecutionEvidence(
-        evidence_id="ev-2", run_id="r1", exit_code=0, stdout="", stderr="", duration_sec=0.2
+        evidence_id="ev-2",
+        run_id="r1",
+        candidate_id="cand-2",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.2,
     )
 
-    conflicting_kwargs: Dict[str, Any] = {
+    conflicting_kwargs: dict[str, Any] = {
         "run_id": "r1",
         "repo_path": Path("/tmp/repo"),
         "evidence": ev1,
@@ -800,7 +825,7 @@ def test_workflow_state_rejects_conflicting_evidence_and_evidences() -> None:
     assert "Cannot specify both legacy 'evidence' and canonical 'evidences'" in str(exc_info.value)
 
     # Non-conflicting: evidence=None with canonical evidences is accepted
-    valid_kwargs: Dict[str, Any] = {
+    valid_kwargs: dict[str, Any] = {
         "run_id": "r1",
         "repo_path": Path("/tmp/repo"),
         "evidence": None,
@@ -865,3 +890,881 @@ def test_workflow_state_canonical_serialization_and_json_roundtrip() -> None:
     assert restored.evidences == (cand_ev,)
     assert restored.evidence == cand_ev
     assert restored.evidence.line_coverage_delta == 5.0
+
+
+# =============================================================================
+# Component 01 Re-engineering Tests (Charter §4.3)
+# Covering: validation bounds, FailureDiagnosis invariant, lazy settings,
+# shared exception identity.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ExecutionEvidence — validation bounds (duration_sec, coverage range)
+# ---------------------------------------------------------------------------
+
+def test_execution_evidence_duration_must_be_non_negative() -> None:
+    """ExecutionEvidence rejects duration_sec < 0."""
+    with pytest.raises(ValidationError, match="duration_sec must be >= 0"):
+        ExecutionEvidence(
+            evidence_id="ev-001",
+            run_id="r1",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_sec=-0.001,
+        )
+
+
+def test_execution_evidence_duration_zero_is_valid() -> None:
+    """ExecutionEvidence accepts duration_sec == 0 (instantaneous result)."""
+    ev = ExecutionEvidence(
+        evidence_id="ev-001",
+        run_id="r1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.0,
+    )
+    assert ev.duration_sec == 0.0
+
+
+def test_execution_evidence_line_coverage_out_of_range() -> None:
+    """ExecutionEvidence rejects line_coverage outside [0.0, 100.0]."""
+    with pytest.raises(ValidationError, match="Coverage value must be in"):
+        ExecutionEvidence(
+            evidence_id="ev-001",
+            run_id="r1",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_sec=1.0,
+            line_coverage=100.001,
+        )
+
+    with pytest.raises(ValidationError, match="Coverage value must be in"):
+        ExecutionEvidence(
+            evidence_id="ev-001",
+            run_id="r1",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_sec=1.0,
+            line_coverage=-0.001,
+        )
+
+
+def test_execution_evidence_branch_coverage_out_of_range() -> None:
+    """ExecutionEvidence rejects branch_coverage outside [0.0, 100.0]."""
+    with pytest.raises(ValidationError, match="Coverage value must be in"):
+        ExecutionEvidence(
+            evidence_id="ev-001",
+            run_id="r1",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_sec=1.0,
+            branch_coverage=101.0,
+        )
+
+
+def test_execution_evidence_coverage_boundaries_valid() -> None:
+    """ExecutionEvidence accepts boundary values 0.0 and 100.0 for coverage."""
+    ev = ExecutionEvidence(
+        evidence_id="ev-001",
+        run_id="r1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=1.5,
+        line_coverage=0.0,
+        branch_coverage=100.0,
+    )
+    assert ev.line_coverage == 0.0
+    assert ev.branch_coverage == 100.0
+
+
+def test_execution_evidence_none_coverage_bypasses_range_check() -> None:
+    """ExecutionEvidence with coverage=None does not trigger range validation."""
+    ev = ExecutionEvidence(
+        evidence_id="ev-001",
+        run_id="r1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=1.0,
+        line_coverage=None,
+        branch_coverage=None,
+    )
+    assert ev.line_coverage is None
+    assert ev.branch_coverage is None
+
+
+# ---------------------------------------------------------------------------
+# TestCandidate — retry_count >= 0
+# ---------------------------------------------------------------------------
+
+def test_test_candidate_retry_count_non_negative() -> None:
+    """TestCandidate rejects retry_count < 0."""
+    with pytest.raises(ValidationError, match="retry_count must be >= 0"):
+        TestCandidate(
+            candidate_id="c001",
+            run_id="r1",
+            target_symbol_name="calc.add",
+            test_file_path=Path("tests/test_calc.py"),
+            candidate_code="def test_add(): pass\n",
+            retry_count=-1,
+        )
+
+
+def test_test_candidate_retry_count_zero_valid() -> None:
+    """TestCandidate accepts retry_count == 0 (default)."""
+    c = TestCandidate(
+        candidate_id="c001",
+        run_id="r1",
+        target_symbol_name="calc.add",
+        test_file_path=Path("tests/test_calc.py"),
+        candidate_code="def test_add(): pass\n",
+        retry_count=0,
+    )
+    assert c.retry_count == 0
+
+
+def test_test_candidate_retry_count_positive_valid() -> None:
+    """TestCandidate accepts positive retry_count."""
+    c = TestCandidate(
+        candidate_id="c001",
+        run_id="r1",
+        target_symbol_name="calc.add",
+        test_file_path=Path("tests/test_calc.py"),
+        candidate_code="def test_add(): pass\n",
+        retry_count=2,
+    )
+    assert c.retry_count == 2
+
+
+# ---------------------------------------------------------------------------
+# FailureDiagnosis — confidence [0.0, 1.0] and APPLICATION_BUG invariant
+# ---------------------------------------------------------------------------
+
+def test_failure_diagnosis_confidence_out_of_range() -> None:
+    """FailureDiagnosis rejects confidence outside [0.0, 1.0]."""
+    with pytest.raises(ValidationError, match="confidence must be in"):
+        FailureDiagnosis(
+            diagnosis_id="d001",
+            evidence_id="ev001",
+            canonical_category=FailureCategory.UNKNOWN,
+            confidence=1.001,
+            triage_engine=TriageEngine.DETERMINISTIC_RULE,
+            explanation="test",
+        )
+
+    with pytest.raises(ValidationError, match="confidence must be in"):
+        FailureDiagnosis(
+            diagnosis_id="d001",
+            evidence_id="ev001",
+            canonical_category=FailureCategory.UNKNOWN,
+            confidence=-0.001,
+            triage_engine=TriageEngine.DETERMINISTIC_RULE,
+            explanation="test",
+        )
+
+
+def test_failure_diagnosis_confidence_boundaries_valid() -> None:
+    """FailureDiagnosis accepts boundary values 0.0 and 1.0 for confidence."""
+    d_min = FailureDiagnosis(
+        diagnosis_id="d001",
+        evidence_id="ev001",
+        canonical_category=FailureCategory.UNKNOWN,
+        confidence=0.0,
+        triage_engine=TriageEngine.DETERMINISTIC_RULE,
+        explanation="min confidence",
+    )
+    d_max = FailureDiagnosis(
+        diagnosis_id="d002",
+        evidence_id="ev001",
+        canonical_category=FailureCategory.UNKNOWN,
+        confidence=1.0,
+        triage_engine=TriageEngine.DETERMINISTIC_RULE,
+        explanation="max confidence",
+    )
+    assert d_min.confidence == 0.0
+    assert d_max.confidence == 1.0
+
+
+def test_failure_diagnosis_application_bug_consistent_true() -> None:
+    """FailureDiagnosis accepts APPLICATION_BUG with is_application_bug=True."""
+    d = FailureDiagnosis(
+        diagnosis_id="d001",
+        evidence_id="ev001",
+        canonical_category=FailureCategory.APPLICATION_BUG,
+        confidence=0.95,
+        triage_engine=TriageEngine.COGNITIVE_LLM,
+        explanation="Application defect confirmed",
+        is_application_bug=True,
+    )
+    assert d.is_application_bug is True
+    assert d.canonical_category == FailureCategory.APPLICATION_BUG
+
+
+def test_failure_diagnosis_application_bug_category_but_flag_false_rejected() -> None:
+    """FailureDiagnosis rejects canonical_category=APPLICATION_BUG with is_application_bug=False."""
+    with pytest.raises(
+        ValidationError,
+        match="canonical_category is APPLICATION_BUG but is_application_bug is False",
+    ):
+        FailureDiagnosis(
+            diagnosis_id="d001",
+            evidence_id="ev001",
+            canonical_category=FailureCategory.APPLICATION_BUG,
+            confidence=0.9,
+            triage_engine=TriageEngine.COGNITIVE_LLM,
+            explanation="Inconsistent",
+            is_application_bug=False,
+        )
+
+
+def test_failure_diagnosis_flag_true_but_wrong_category_rejected() -> None:
+    """FailureDiagnosis rejects is_application_bug=True with non-APPLICATION_BUG category."""
+    with pytest.raises(
+        ValidationError,
+        match="is_application_bug is True but canonical_category is",
+    ):
+        FailureDiagnosis(
+            diagnosis_id="d001",
+            evidence_id="ev001",
+            canonical_category=FailureCategory.UNKNOWN,
+            confidence=0.5,
+            triage_engine=TriageEngine.DETERMINISTIC_RULE,
+            explanation="Inconsistent flag",
+            is_application_bug=True,
+        )
+
+
+def test_failure_diagnosis_non_bug_category_with_flag_false_accepted() -> None:
+    """FailureDiagnosis accepts non-APPLICATION_BUG category with is_application_bug=False."""
+    for cat in [
+        FailureCategory.TEST_OUTDATED,
+        FailureCategory.INVALID_GENERATED_TEST,
+        FailureCategory.ENVIRONMENT_FAILURE,
+        FailureCategory.CONFIGURATION_ERROR,
+        FailureCategory.LLM_FAILURE,
+        FailureCategory.UNKNOWN,
+    ]:
+        d = FailureDiagnosis(
+            diagnosis_id="d001",
+            evidence_id="ev001",
+            canonical_category=cat,
+            confidence=0.8,
+            triage_engine=TriageEngine.DETERMINISTIC_RULE,
+            explanation=f"Category {cat.value}",
+            is_application_bug=False,
+        )
+        assert d.is_application_bug is False
+
+
+# ---------------------------------------------------------------------------
+# WorkflowState — retry counter validations
+# ---------------------------------------------------------------------------
+
+def test_workflow_state_generation_retry_count_non_negative() -> None:
+    """WorkflowState rejects generation_retry_count < 0."""
+    with pytest.raises(ValidationError, match="generation_retry_count must be >= 0"):
+        WorkflowState(
+            run_id="r1",
+            repo_path=Path("/tmp/repo"),
+            generation_retry_count=-1,
+        )
+
+
+def test_workflow_state_max_generation_retries_non_negative() -> None:
+    """WorkflowState rejects max_generation_retries < 0."""
+    with pytest.raises(ValidationError, match="max_generation_retries must be >= 0"):
+        WorkflowState(
+            run_id="r1",
+            repo_path=Path("/tmp/repo"),
+            max_generation_retries=-1,
+        )
+
+
+def test_workflow_state_retry_count_within_budget() -> None:
+    """WorkflowState rejects generation_retry_count > max_generation_retries."""
+    with pytest.raises(ValidationError, match="exceeds max_generation_retries"):
+        WorkflowState(
+            run_id="r1",
+            repo_path=Path("/tmp/repo"),
+            generation_retry_count=3,
+            max_generation_retries=2,
+        )
+
+
+def test_workflow_state_retry_count_at_max_accepted() -> None:
+    """WorkflowState accepts generation_retry_count == max_generation_retries."""
+    state = WorkflowState(
+        run_id="r1",
+        repo_path=Path("/tmp/repo"),
+        generation_retry_count=2,
+        max_generation_retries=2,
+    )
+    assert state.generation_retry_count == 2
+    assert state.max_generation_retries == 2
+
+
+def test_workflow_state_zero_retries_valid() -> None:
+    """WorkflowState accepts zero retry counts (default state)."""
+    state = WorkflowState(
+        run_id="r1",
+        repo_path=Path("/tmp/repo"),
+        generation_retry_count=0,
+        max_generation_retries=0,
+    )
+    assert state.generation_retry_count == 0
+    assert state.max_generation_retries == 0
+
+
+# ---------------------------------------------------------------------------
+# F-05: Lazy get_settings() and lazy settings compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_get_settings_is_lazy_no_eager_env_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Importing config and core does NOT eagerly instantiate Settings (no .env load at import time).
+    get_settings() and settings attributes load .env lazily on first access only.
+    """
+    import importlib
+
+    import agentic_test.core as core_pkg
+    import agentic_test.core.config as cfg_module
+
+    env_file = tmp_path / ".env"
+    env_file.write_text('AGENTIC_TEST_APP_NAME="LazyEnvLoadedApp"\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGENTIC_TEST_APP_NAME", raising=False)
+
+    # Reload config and core to simulate fresh import in directory containing .env
+    importlib.reload(cfg_module)
+    importlib.reload(core_pkg)
+
+    try:
+        # Must NOT have instantiated Settings or populated lru_cache on import
+        assert cfg_module.get_settings.cache_info().currsize == 0
+
+        # Importing `settings` proxy must also NOT trigger instantiation
+        from agentic_test.core.config import settings as lazy_settings
+
+        assert cfg_module.get_settings.cache_info().currsize == 0
+
+        # Accessing an attribute triggers lazy load from .env
+        assert lazy_settings.app_name == "LazyEnvLoadedApp"
+        assert cfg_module.get_settings.cache_info().currsize == 1
+        assert cfg_module.get_settings().app_name == "LazyEnvLoadedApp"
+    finally:
+        cfg_module.get_settings.cache_clear()
+
+
+def test_get_settings_returns_cached_singleton() -> None:
+    """get_settings() with @lru_cache returns the identical object on repeated calls."""
+    from agentic_test.core.config import get_settings
+
+    s1 = get_settings()
+    s2 = get_settings()
+    assert s1 is s2  # Same singleton
+
+
+def test_settings_lazy_proxy_attribute_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Module-level 'settings' is a lazy proxy: accessing and monkeypatching its
+    attributes works seamlessly without eager Settings() instantiation on import.
+    """
+    from agentic_test.core.config import get_settings, settings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGENTIC_TEST_OPENAI_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        assert isinstance(settings.app_name, str)
+        assert settings.default_timeout_sec == 30.0
+        assert settings.memory_limit == "512m"
+        assert settings.pids_limit == 100
+        assert settings.openai_api_key is None
+
+        # Verify monkeypatch compatibility (used in tests/test_cli.py)
+        monkeypatch.setattr(settings, "openai_api_key", None)
+        assert settings.openai_api_key is None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_settings_importable_from_core_and_core_config() -> None:
+    """
+    'from agentic_test.core.config import settings' (used in cli/service_factory.py)
+    and 'from agentic_test.core import get_settings, settings' continue to work.
+    """
+    from agentic_test.core import get_settings as core_get_settings
+    from agentic_test.core import settings as core_settings
+    from agentic_test.core.config import get_settings, settings
+
+    assert core_get_settings is get_settings
+    assert isinstance(settings.app_name, str)
+    assert core_settings.app_name == settings.app_name
+
+
+def test_execution_evidence_rejects_non_finite_duration() -> None:
+    """ExecutionEvidence rejects NaN and Inf duration_sec."""
+    for bad_duration in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError, match="duration_sec must be >= 0"):
+            ExecutionEvidence(
+                evidence_id="ev-nan",
+                run_id="r1",
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_sec=bad_duration,
+            )
+
+
+def test_execution_evidence_coverage_delta_bounds_and_non_finite() -> None:
+    """
+    ExecutionEvidence enforces [-100.0, 100.0] and finite values on
+    line_coverage_delta and branch_coverage_delta when not None.
+    """
+    # Valid boundary values and None
+    ev_min = ExecutionEvidence(
+        evidence_id="ev-delta-min",
+        run_id="r1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=1.0,
+        line_coverage_delta=-100.0,
+        branch_coverage_delta=100.0,
+    )
+    assert ev_min.line_coverage_delta == -100.0
+    assert ev_min.branch_coverage_delta == 100.0
+
+    ev_zero = ExecutionEvidence(
+        evidence_id="ev-delta-zero",
+        run_id="r1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=1.0,
+        line_coverage_delta=0.0,
+        branch_coverage_delta=None,
+    )
+    assert ev_zero.line_coverage_delta == 0.0
+    assert ev_zero.branch_coverage_delta is None
+
+    for field_name in ("line_coverage_delta", "branch_coverage_delta"):
+        for bad_val in (-100.001, 100.001, float("nan"), float("inf"), float("-inf")):
+            kwargs: dict[str, Any] = {
+                "evidence_id": "ev-bad-delta",
+                "run_id": "r1",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "duration_sec": 1.0,
+                field_name: bad_val,
+            }
+            with pytest.raises(ValidationError, match="Coverage delta value must be finite"):
+                ExecutionEvidence(**kwargs)
+
+
+def test_settings_proxy_mutation_syncs_with_get_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Mutating attributes via `settings` or `monkeypatch.setattr(settings, ...)`
+    stays completely in sync with `get_settings()`, and undo restores cleanly.
+    """
+    from pydantic import SecretStr
+
+    from agentic_test.core.config import get_settings, settings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGENTIC_TEST_OPENAI_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        # Direct mutation via proxy reflects on get_settings()
+        settings.openai_api_key = SecretStr("sk-proxy-test")
+        cached = get_settings()
+        assert cached.openai_api_key is not None
+        assert cached.openai_api_key.get_secret_value() == "sk-proxy-test"
+
+        # monkeypatch.setattr(settings, ...) reflects on get_settings() and restores cleanly
+        local_mp = pytest.MonkeyPatch()
+        local_mp.setattr(settings, "openai_api_key", None)
+        assert settings.openai_api_key is None
+        assert get_settings().openai_api_key is None
+
+        local_mp.undo()
+        assert settings.openai_api_key is not None
+        assert settings.openai_api_key.get_secret_value() == "sk-proxy-test"
+        assert get_settings().openai_api_key is not None
+        assert get_settings().openai_api_key.get_secret_value() == "sk-proxy-test"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_workflow_state_legacy_migration_does_not_mutate_caller_dict() -> None:
+    """
+    Passing a caller-owned dictionary with legacy 'evidence' to
+    WorkflowState.model_validate(...) must not mutate the caller dictionary.
+    """
+    cand_ev = ExecutionEvidence(
+        evidence_id="ev-cand-1",
+        run_id="r1",
+        candidate_id="cand-1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.2,
+    )
+    caller_payload: dict[str, Any] = {
+        "run_id": "r1",
+        "repo_path": Path("/tmp/repo"),
+        "evidence": cand_ev,
+    }
+    snapshot_keys = set(caller_payload.keys())
+
+    state = WorkflowState.model_validate(caller_payload)
+
+    assert state.evidences == (cand_ev,)
+    assert set(caller_payload.keys()) == snapshot_keys
+    assert "evidence" in caller_payload
+    assert caller_payload["evidence"] is cand_ev
+    assert "evidences" not in caller_payload
+    assert "baseline_evidence" not in caller_payload
+
+
+def test_workflow_state_legacy_migration_routes_baseline_and_checks_conflicts() -> None:
+    """
+    Legacy 'evidence' with candidate_id=None routes to baseline_evidence;
+    conflicts against baseline_evidence or evidences are rejected cleanly.
+    """
+    base_ev = ExecutionEvidence(
+        evidence_id="ev-base-1",
+        run_id="r1",
+        candidate_id=None,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.3,
+    )
+    cand_ev = ExecutionEvidence(
+        evidence_id="ev-cand-1",
+        run_id="r1",
+        candidate_id="cand-1",
+        exit_code=1,
+        stdout="",
+        stderr="",
+        duration_sec=0.4,
+    )
+
+    # 1. Single baseline evidence (ExecutionEvidence) routes to baseline_evidence
+    s_base = WorkflowState.model_validate(
+        {"run_id": "r1", "repo_path": Path("/tmp/repo"), "evidence": base_ev}
+    )
+    assert s_base.baseline_evidence == base_ev
+    assert s_base.evidences == ()
+    assert s_base.evidence is None
+
+    # 2. Single baseline dict routes to baseline_evidence
+    s_base_dict = WorkflowState.model_validate(
+        {
+            "run_id": "r1",
+            "repo_path": Path("/tmp/repo"),
+            "evidence": base_ev.model_dump(),
+        }
+    )
+    assert s_base_dict.baseline_evidence == base_ev
+    assert s_base_dict.evidences == ()
+
+    # 3. Mixed legacy list [base_ev, cand_ev] splits cleanly
+    s_mixed = WorkflowState.model_validate(
+        {
+            "run_id": "r1",
+            "repo_path": Path("/tmp/repo"),
+            "evidence": [base_ev, cand_ev],
+        }
+    )
+    assert s_mixed.baseline_evidence == base_ev
+    assert s_mixed.evidences == (cand_ev,)
+
+    # 4. Multiple baseline evidences in legacy list are rejected
+    base_ev_2 = ExecutionEvidence(
+        evidence_id="ev-base-2",
+        run_id="r1",
+        candidate_id=None,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.3,
+    )
+    with pytest.raises(ValidationError, match="multiple baseline records"):
+        WorkflowState.model_validate(
+            {
+                "run_id": "r1",
+                "repo_path": Path("/tmp/repo"),
+                "evidence": [base_ev, base_ev_2],
+            }
+        )
+
+    # 5. Conflict between legacy 'evidence' and canonical 'baseline_evidence' is rejected
+    with pytest.raises(
+        ValidationError,
+        match="Cannot specify both legacy 'evidence' and canonical 'baseline_evidence'",
+    ):
+        WorkflowState.model_validate(
+            {
+                "run_id": "r1",
+                "repo_path": Path("/tmp/repo"),
+                "evidence": cand_ev,
+                "baseline_evidence": base_ev,
+            }
+        )
+
+    # 6. Conflict between legacy baseline 'evidence' and canonical 'baseline_evidence' is rejected
+    with pytest.raises(
+        ValidationError,
+        match="Cannot specify both legacy 'evidence' and canonical 'baseline_evidence'",
+    ):
+        WorkflowState.model_validate(
+            {
+                "run_id": "r1",
+                "repo_path": Path("/tmp/repo"),
+                "evidence": base_ev,
+                "baseline_evidence": base_ev_2,
+            }
+        )
+
+
+def test_workflow_state_f03_candidate_id_and_run_id_invariants() -> None:
+    """
+    F-03 invariants:
+    - baseline_evidence must have candidate_id=None and match state.run_id.
+    - every item in evidences must have candidate_id != None and match state.run_id.
+    """
+    bad_baseline_with_cand = ExecutionEvidence(
+        evidence_id="ev-1",
+        run_id="r1",
+        candidate_id="cand-1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.1,
+    )
+    with pytest.raises(ValidationError, match="baseline_evidence must have candidate_id=None"):
+        WorkflowState(
+            run_id="r1",
+            repo_path=Path("/tmp/repo"),
+            baseline_evidence=bad_baseline_with_cand,
+        )
+
+    bad_candidate_null_id = ExecutionEvidence(
+        evidence_id="ev-2",
+        run_id="r1",
+        candidate_id=None,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.1,
+    )
+    with pytest.raises(ValidationError, match="must have a non-None candidate_id"):
+        WorkflowState(
+            run_id="r1",
+            repo_path=Path("/tmp/repo"),
+            evidences=(bad_candidate_null_id,),
+        )
+
+    mismatched_baseline = ExecutionEvidence(
+        evidence_id="ev-3",
+        run_id="other-run",
+        candidate_id=None,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.1,
+    )
+    with pytest.raises(
+        ValidationError,
+        match=r"baseline_evidence\.run_id .* must match state\.run_id",
+    ):
+        WorkflowState(
+            run_id="r1",
+            repo_path=Path("/tmp/repo"),
+            baseline_evidence=mismatched_baseline,
+        )
+
+    mismatched_cand = ExecutionEvidence(
+        evidence_id="ev-4",
+        run_id="other-run",
+        candidate_id="cand-1",
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_sec=0.1,
+    )
+    with pytest.raises(ValidationError, match=r"run_id .* must match state\.run_id"):
+        WorkflowState(
+            run_id="r1",
+            repo_path=Path("/tmp/repo"),
+            evidences=(mismatched_cand,),
+        )
+
+
+# ---------------------------------------------------------------------------
+# U-02: Shared exception identity — LLMCommunicationError & SchemaValidationError
+# ---------------------------------------------------------------------------
+
+
+def _load_generation_exceptions_module() -> object:
+    """
+    Import agentic_test.generation.exceptions, falling back to direct module
+    loading from disk if optional 'litellm' ([llm] extra) is absent in dev-only
+    environments (since generation/__init__.py eagerly imports litellm_service).
+    """
+    import importlib
+    import importlib.util
+
+    if importlib.util.find_spec("litellm") is not None:
+        return importlib.import_module("agentic_test.generation.exceptions")
+
+    exceptions_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "agentic_test"
+        / "generation"
+        / "exceptions.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "agentic_test_generation_exceptions_direct",
+        exceptions_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_llm_communication_error_is_same_class_in_protocols_and_generation() -> None:
+    """
+    U-02: LLMCommunicationError imported from core.protocols.llm and from
+    generation.exceptions must be the IDENTICAL class object (not copies).
+    """
+    from agentic_test.core.protocols.llm import LLMCommunicationError as ProtoError
+
+    gen_exceptions = _load_generation_exceptions_module()
+    gen_error = getattr(gen_exceptions, "LLMCommunicationError")
+
+    assert ProtoError is gen_error, (
+        "LLMCommunicationError in generation.exceptions must be the same class "
+        "as the one defined in core.protocols.llm (re-export, not a copy)."
+    )
+
+
+def test_schema_validation_error_is_same_class_in_protocols_and_generation() -> None:
+    """
+    U-02: SchemaValidationError imported from core.protocols.llm and from
+    generation.exceptions must be the IDENTICAL class object (not copies).
+    """
+    from agentic_test.core.protocols.llm import SchemaValidationError as ProtoError
+
+    gen_exceptions = _load_generation_exceptions_module()
+    gen_error = getattr(gen_exceptions, "SchemaValidationError")
+
+    assert ProtoError is gen_error, (
+        "SchemaValidationError in generation.exceptions must be the same class "
+        "as the one defined in core.protocols.llm (re-export, not a copy)."
+    )
+
+
+def test_generation_exceptions_retains_generation_only_errors() -> None:
+    """
+    U-02: Generation-specific exceptions (GenerationError, ContextBudgetExceededError)
+    remain in generation.exceptions.
+    """
+    gen_exceptions = _load_generation_exceptions_module()
+    generation_error = getattr(gen_exceptions, "GenerationError")
+    budget_error = getattr(gen_exceptions, "ContextBudgetExceededError")
+    assert issubclass(budget_error, generation_error)
+
+
+def test_llm_communication_error_is_catchable_via_protocol_base() -> None:
+    """
+    LLMCommunicationError raised in generation context can be caught via
+    core.protocols.llm.LLMError base class.
+    """
+    from agentic_test.core.protocols.llm import LLMError
+
+    gen_exceptions = _load_generation_exceptions_module()
+    gen_comm_error = getattr(gen_exceptions, "LLMCommunicationError")
+
+    with pytest.raises(LLMError):
+        raise gen_comm_error("provider timeout")
+
+
+def test_schema_validation_error_is_catchable_via_protocol_base() -> None:
+    """
+    SchemaValidationError raised in generation context can be caught via
+    core.protocols.llm.LLMError base class.
+    """
+    from agentic_test.core.protocols.llm import LLMError
+
+    gen_exceptions = _load_generation_exceptions_module()
+    gen_schema_error = getattr(gen_exceptions, "SchemaValidationError")
+
+    with pytest.raises(LLMError):
+        raise gen_schema_error("schema mismatch")
+
+
+def test_core_init_exports_llm_exceptions() -> None:
+    """
+    F-12: core.__init__.__all__ includes LLMService, LLMCommunicationError,
+    SchemaValidationError and they resolve to the protocol-layer classes.
+    """
+    import agentic_test.core as core_pkg
+    from agentic_test.core.protocols.llm import (
+        LLMCommunicationError as ProtoLLMComm,
+    )
+    from agentic_test.core.protocols.llm import (
+        LLMService as ProtoLLMService,
+    )
+    from agentic_test.core.protocols.llm import (
+        SchemaValidationError as ProtoSchema,
+    )
+
+    assert "LLMService" in core_pkg.__all__
+    assert "LLMCommunicationError" in core_pkg.__all__
+    assert "SchemaValidationError" in core_pkg.__all__
+
+    assert core_pkg.LLMService is ProtoLLMService
+    assert core_pkg.LLMCommunicationError is ProtoLLMComm
+    assert core_pkg.SchemaValidationError is ProtoSchema
+
+
+def test_core_init_exports_sandbox_types() -> None:
+    """
+    F-13: core.__init__.__all__ includes SandboxManager, SandboxConfig,
+    ExecutionRawResult and sandbox exception classes.
+    """
+    import agentic_test.core as core_pkg
+
+    for name in [
+        "SandboxManager",
+        "SandboxConfig",
+        "ExecutionRawResult",
+        "SandboxError",
+        "SandboxExecutionError",
+        "SandboxInitializationError",
+    ]:
+        assert name in core_pkg.__all__, f"{name!r} missing from core.__all__"

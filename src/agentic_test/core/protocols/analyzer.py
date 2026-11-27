@@ -5,14 +5,13 @@ Decouples static source-code parsing and symbol extraction from underlying parse
 """
 
 from pathlib import Path
-from typing import List, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from agentic_test.core.models import DiffHunk, SymbolContract
 
 
 class SyntaxParsingError(Exception):
     """Raised when source code contains unrecoverable syntax errors."""
-    pass
 
 
 @runtime_checkable
@@ -22,7 +21,7 @@ class CodeAnalyzer(Protocol):
     from underlying parser implementations (Python ast, Tree-sitter, etc.).
     """
 
-    def parse_symbols(self, file_path: Path, content: str) -> List[SymbolContract]:
+    def parse_symbols(self, file_path: Path, content: str) -> list[SymbolContract]:
         """
         Statically parses source code content into structured SymbolContract entities.
         Must operate deterministically and NEVER execute the parsed code.
@@ -34,7 +33,7 @@ class CodeAnalyzer(Protocol):
         """
         ...
 
-    def extract_dependencies(self, file_path: Path, content: str) -> List[str]:
+    def extract_dependencies(self, file_path: Path, content: str) -> list[str]:
         """
         Extracts imported module dependencies, symbols, and standard libraries.
 
@@ -46,9 +45,9 @@ class CodeAnalyzer(Protocol):
 
     def resolve_affected_symbols(
         self,
-        symbols: List[SymbolContract],
-        diff_hunks: List[DiffHunk],
-    ) -> List[SymbolContract]:
+        symbols: list[SymbolContract],
+        diff_hunks: list[DiffHunk],
+    ) -> list[SymbolContract]:
         """
         Intersects unified diff line ranges with AST symbol spans to identify
         all callable symbols modified or introduced by the working tree diff.

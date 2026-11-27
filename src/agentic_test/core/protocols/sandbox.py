@@ -4,23 +4,21 @@ Stage 3 Section 4.4.2.2 Listing 4.2.
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
+
 from pydantic import BaseModel, Field
 
 
 class SandboxError(Exception):
     """Base exception for sandbox infrastructure errors."""
-    pass
 
 
 class SandboxInitializationError(SandboxError):
     """Raised when environment or container provisioning fails."""
-    pass
 
 
 class SandboxExecutionError(SandboxError):
     """Raised when command execution fails due to container or infrastructure error."""
-    pass
 
 
 class SandboxConfig(BaseModel):
@@ -34,9 +32,9 @@ class SandboxConfig(BaseModel):
     cpu_quota: float = 1.0
     pids_limit: int = 100
     network_disabled: bool = True
-    read_only_mounts: Dict[Path, str] = Field(default_factory=dict)
-    read_write_mounts: Dict[Path, str] = Field(default_factory=dict)
-    environment_vars: Dict[str, str] = Field(default_factory=dict)
+    read_only_mounts: dict[Path, str] = Field(default_factory=dict)
+    read_write_mounts: dict[Path, str] = Field(default_factory=dict)
+    environment_vars: dict[str, str] = Field(default_factory=dict)
 
 
 class ExecutionRawResult(BaseModel):
@@ -73,7 +71,7 @@ class SandboxManager(Protocol):
     def execute_command(
         self,
         container_id: str,
-        command: List[str],
+        command: list[str],
         workdir: str = "/workspace",
     ) -> ExecutionRawResult:
         """

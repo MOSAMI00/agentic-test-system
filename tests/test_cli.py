@@ -140,7 +140,7 @@ def test_cli_run_success_exit_0(runner: CliRunner, git_repo: Path, db_path: Path
     )
     cand = TestCandidate(
         candidate_id="cand-1",
-        run_id="run-cli",
+        run_id="run-cli-001",
         target_symbol_name="app.hello",
         test_file_path=Path("tests/test_app.py"),
         candidate_code="def test_hello(): assert hello() == 'world'\n",
@@ -148,7 +148,7 @@ def test_cli_run_success_exit_0(runner: CliRunner, git_repo: Path, db_path: Path
     )
     ev = ExecutionEvidence(
         evidence_id="ev-1",
-        run_id="run-cli",
+        run_id="run-cli-001",
         candidate_id="cand-1",
         exit_code=0,
         stdout="1 passed\n",

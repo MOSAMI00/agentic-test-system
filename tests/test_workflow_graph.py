@@ -473,7 +473,12 @@ def test_engine_route_to_docker_execution_success(
         route=WorkflowRoute.ROUTE_TO_DOCKER_EXECUTION,
         existing_tests=(Path("tests/test_existing.py"),),
     )
-    base_ev = _make_evidence(evidence_id="base-ev", candidate_id=None, exit_code=0)
+    base_ev = _make_evidence(
+        evidence_id="base-ev",
+        run_id="run-docker-ok",
+        candidate_id=None,
+        exit_code=0,
+    )
 
     mock_analysis = MagicMock()
     mock_analysis.analyze.return_value = snapshot
@@ -563,9 +568,22 @@ def test_engine_route_generation_nominal_success(
     """Verifies nominal generation & execution success: 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 7 -> END."""
     snapshot = _make_snapshot()
     plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
-    cand_raw = _make_candidate(candidate_id="c1", status=ValidationStatus.PENDING)
-    cand_passed = _make_candidate(candidate_id="c1", status=ValidationStatus.PASSED)
-    cand_ev = _make_evidence(evidence_id="ev1", candidate_id="c1", exit_code=0)
+    cand_raw = _make_candidate(
+        candidate_id="c1",
+        run_id="run-gen-ok",
+        status=ValidationStatus.PENDING,
+    )
+    cand_passed = _make_candidate(
+        candidate_id="c1",
+        run_id="run-gen-ok",
+        status=ValidationStatus.PASSED,
+    )
+    cand_ev = _make_evidence(
+        evidence_id="ev1",
+        run_id="run-gen-ok",
+        candidate_id="c1",
+        exit_code=0,
+    )
 
     mock_analysis = MagicMock(analyze=MagicMock(return_value=snapshot))
     mock_planner = MagicMock(plan=MagicMock(return_value=plan))
@@ -603,8 +621,17 @@ def test_engine_route_generation_failure_diagnosed(
     """Verifies generation test failure diagnosis: 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> END."""
     snapshot = _make_snapshot()
     plan = _make_plan(route=WorkflowRoute.ROUTE_TO_TEST_GENERATION)
-    cand = _make_candidate(candidate_id="c_fail", status=ValidationStatus.PASSED)
-    ev_fail = _make_evidence(evidence_id="ev_fail", candidate_id="c_fail", exit_code=1)
+    cand = _make_candidate(
+        candidate_id="c_fail",
+        run_id="run-gen-diag",
+        status=ValidationStatus.PASSED,
+    )
+    ev_fail = _make_evidence(
+        evidence_id="ev_fail",
+        run_id="run-gen-diag",
+        candidate_id="c_fail",
+        exit_code=1,
+    )
     diag = _make_diagnosis(diagnosis_id="diag_1", evidence_id="ev_fail")
 
     mock_analysis = MagicMock(analyze=MagicMock(return_value=snapshot))

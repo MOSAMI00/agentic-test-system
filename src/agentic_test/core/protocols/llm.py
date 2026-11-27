@@ -1,12 +1,28 @@
 """
 Formal protocol defining Large Language Model (LLM) cognitive services.
 Stage 3 Section 4.4.2.3 Listing 4.3.
+
+Shared LLM exceptions (U-02) live here so that both the generation layer and
+the diagnosis layer can import them without creating a cross-layer dependency.
 """
 
-from typing import Protocol, Type, TypeVar, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
+
 from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class LLMError(Exception):
+    """Base exception for all LLM service errors."""
+
+
+class LLMCommunicationError(LLMError):
+    """Raised when communication with an LLM provider fails or times out."""
+
+
+class SchemaValidationError(LLMError):
+    """Raised when LLM output violates the required structured output schema or is unparseable."""
 
 
 @runtime_checkable
@@ -21,7 +37,7 @@ class LLMService(Protocol):
         self,
         prompt: str,
         system_instruction: str,
-        response_schema: Type[T],
+        response_schema: type[T],
         temperature: float = 0.0,
         max_tokens: int = 2048,
     ) -> T:
